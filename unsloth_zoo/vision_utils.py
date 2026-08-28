@@ -40,7 +40,34 @@ __all__ = [
 # share one source of truth. Re-exported here for backwards compatibility.
 from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
-import torch
+# torch is optional here: process_vision_info's image path (fetch_image,
+# extract_vision_info) never touches it, only the video-reading functions and
+# UnslothVisionDataCollator (CUDA-only) do. Unguarded, this import alone broke
+# every MLX/Apple Silicon caller of process_vision_info -- including plain
+# image extraction -- on the torch-free MLX path (unsloth_zoo/mlx/utils.py's
+# _extract_vlm_images imports this module lazily, so the failure surfaced as
+# a training-time crash, not an import-time one). Mirrors the torchvision
+# guard below.
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    torch = None
+    HAS_TORCH = False
+
+
+def _torch_no_grad_or_noop(fn):
+    """@torch.no_grad(), but importable without torch.
+
+    UnslothVisionDataCollator is CUDA-only and unusable without torch
+    regardless, but Python evaluates decorators while defining the class body
+    -- at module import time -- so `@torch.no_grad()` directly would crash
+    importing this module on a torch-free install before the class is ever
+    touched, the same way the bare `import torch` above did.
+    """
+    return torch.no_grad()(fn) if torch is not None else fn
+
+
 import numpy as np
 from PIL import Image
 import base64
@@ -1550,7 +1577,7 @@ class UnslothVisionDataCollator:
             raise ValueError("Tokenizer must define `pad_token_id` for prompt–completion collation.")
         return pad_id
 
-    @torch.no_grad()
+    @_torch_no_grad_or_noop
     def _flush_to_side(
         self,
         attention_mask: torch.Tensor,

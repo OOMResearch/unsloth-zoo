@@ -24,7 +24,15 @@ __all__ = [
 
 from typing import Union, Callable, Optional, List, Dict
 import itertools as _itertools
-import torch
+# Optional: unsloth_zoo/mlx/trainer.py already imports names from this module
+# lazily (inside functions, not at its own top level) specifically to stay
+# off this dependency on the torch-free MLX path. vision_utils.py's own
+# top-level import of train_on_responses_only did not, and dragged this
+# unconditional import in behind it.
+try:
+    import torch
+except ImportError:
+    torch = None
 
 def _iterable_batch_size(dataset, default = 1000):
     """Batch size to re-use when mapping an IterableDataset.

@@ -17,7 +17,15 @@
 import os
 import tempfile
 import shutil
-import torch
+# Optional: this module's dtype helpers are pure config/string manipulation
+# and never need torch themselves, but every caller so far has been a
+# CUDA/torch-only module -- until unsloth_zoo/mlx/utils.py's VLM image
+# extraction reached this import transitively via vision_utils.py on the
+# torch-free MLX path.
+try:
+    import torch
+except ImportError:
+    torch = None
 import json
 import re
 from .log import logger
