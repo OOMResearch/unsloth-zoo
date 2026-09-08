@@ -7482,51 +7482,70 @@ class MLXTrainer:
                 )
                 if pending_stats is not None:
                     _metric_eval = (*_metric_eval, pending_stats)
+            # Pack every "how many tokens do I need this step" scalar into ONE
+            # collective and ONE host readback instead of two/three separate
+            # mx.eval()+.item() round-trips. The zero-supervised-token guard's
+            # global count and (when opted in) the input-token count for HF's
+            # num_input_tokens_seen are both summed via the same
+            # _distributed_all_sum mechanism, so stack them and all-sum once;
+            # the result rides in the SAME eval_targets boundary below as
+            # model/optimizer state, rather than forcing its own sync. The
+            # gate (track_input_tokens) is rank-uniform config, so every rank
+            # packs the same shape and stays in lockstep on the collective.
+            if track_input_tokens:
+                _local_input_toks = mx.array(
+                    _mlx_batch_input_token_count(
+                        batch_data,
+                        mode=input_token_mode,
+                        pad_token_id=input_token_pad_id,
+                    ), dtype=mx.int32,
+                )
+                _local_tok_pack = mx.stack(
+                    [supervised_toks.astype(mx.int32), _local_input_toks]
+                )
+            else:
+                _local_tok_pack = supervised_toks.astype(mx.int32)
+            _global_tok_pack = self._distributed_all_sum(
+                _local_tok_pack, stream=mx.cpu,
+            )
             # One evaluation boundary: the reported norm (when present) is
-            # evaluated together with model/optimizer state and metric
-            # accumulators, never as a separate earlier graph execution.
-            eval_targets = [state, *_metric_eval]
+            # evaluated together with model/optimizer state, metric
+            # accumulators, and the packed token-count collective above,
+            # never as a separate earlier graph execution.
+            eval_targets = [state, *_metric_eval, _global_tok_pack]
             if grad_accum_state is not None:
                 eval_targets.append(grad_accum_state[0])
                 eval_targets.append(grad_accum_state[1])
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
             mx.eval(*eval_targets)
-            global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
-            mx.eval(global_toks)
-            if int(global_toks.item()) == 0:
+            if track_input_tokens:
+                _tok_pack_items = _global_tok_pack.tolist()
+                global_toks_value = int(_tok_pack_items[0])
+                global_input_toks_value = int(_tok_pack_items[1])
+            else:
+                global_toks_value = int(_global_tok_pack.item())
+                global_input_toks_value = None
+            if global_toks_value == 0:
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
             # Global INPUT-token count for HF's num_input_tokens_seen, only when the
-            # run opted in (track_input_tokens). global_toks above is the loss mask's
-            # supervised-token count (used for the zero-token guard), not the
-            # input-token count HF's field reports, so counting it would undercount
-            # prompts and masked tokens. Sum the batch input positions the selected
-            # mode counts and all-reduce that (same global gather semantics as HF
-            # and as global_toks). The gate and the mode are rank-uniform config,
-            # so every rank skips or runs it together.
+            # run opted in (track_input_tokens). The supervised-token half of the
+            # pack above is the loss mask's count (used for the zero-token guard),
+            # not the input-token count HF's field reports, so counting it would
+            # undercount prompts and masked tokens. Its collective and readback are
+            # now folded into the pack above (same global gather semantics as HF).
             if track_input_tokens:
-                global_input_toks = self._distributed_all_sum(
-                    mx.array(
-                        _mlx_batch_input_token_count(
-                            batch_data,
-                            mode=input_token_mode,
-                            pad_token_id=input_token_pad_id,
-                        ), dtype=mx.int32,
-                    ),
-                    stream=mx.cpu,
-                )
-                mx.eval(global_input_toks)
                 # HF's num_input_tokens_seen is an all-rank count of INPUT tokens,
                 # read directly by token-budget callbacks. Use the all-reduced input
-                # count, not global_toks (label tokens) and not the rank-local value
+                # count, not the supervised-token count and not the rank-local value
                 # (undercounts by ~world_size). Incremented BEFORE on_optimizer_step,
                 # as HF advances it right after the forward, so a token-budget
                 # callback sees this microbatch at the step it fires on.
-                self.state.num_input_tokens_seen += int(global_input_toks.item())
+                self.state.num_input_tokens_seen += global_input_toks_value
             if do_update:
                 _fire("on_optimizer_step")
                 # Do NOT latch a callback should_training_stop here. HF runs
