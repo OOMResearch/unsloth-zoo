@@ -698,19 +698,33 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         if self._shape_plan is not None and phase is not None:
             family = self.batch_family(index)
             width = self._shape_plan.endpoint_for(family, width)
-        batch = np.full((2 * len(rows), width), self.pad_id, dtype=np.int32)
-        lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
-        for offset, row in enumerate(rows):
-            for output_row, values, prompt_length in (
-                (offset, row.chosen, len(row.chosen_prompt_ids)),
-                (
-                    offset + len(rows), row.rejected,
-                    len(row.rejected_prompt_ids),
-                ),
-            ):
-                size = min(len(values), width)
-                batch[output_row, :size] = values[:size]
-                lengths[output_row] = (prompt_length, size)
+        n_rows = len(rows)
+        batch = np.full((2 * n_rows, width), self.pad_id, dtype=np.int32)
+        lengths = np.zeros((2 * n_rows, 2), dtype=np.int32)
+        # Two output rows (chosen, rejected) per source row, in the same
+        # ordering the original per-row loop produced: chosen rows first
+        # (offsets [0, n_rows)), then rejected rows (offsets [n_rows, 2*n_rows)).
+        all_values = [row.chosen for row in rows] + [row.rejected for row in rows]
+        prompt_lengths = np.array(
+            [len(row.chosen_prompt_ids) for row in rows]
+            + [len(row.rejected_prompt_ids) for row in rows],
+            dtype=np.int32,
+        )
+        sizes = np.minimum(
+            np.array([len(values) for values in all_values], dtype=np.int32), width,
+        )
+        # Vectorized ragged-to-dense pack: scatter each row's (variable-length,
+        # truncated-to-`size`) token slice into `batch` via a flat index pair
+        # instead of one numpy assignment per row.
+        row_idx = np.repeat(np.arange(2 * n_rows), sizes)
+        col_idx = np.concatenate([np.arange(size) for size in sizes]) if n_rows else \
+            np.empty((0,), dtype=np.int32)
+        flat_values = np.concatenate(
+            [np.asarray(values[:size], dtype=np.int32) for values, size in zip(all_values, sizes)]
+        ) if n_rows else np.empty((0,), dtype=np.int32)
+        batch[row_idx, col_idx] = flat_values
+        lengths[:, 0] = prompt_lengths
+        lengths[:, 1] = sizes
         return mx.array(batch), mx.array(lengths), mx.array(
             self._normalizers[index], dtype=mx.int32,
         )
@@ -838,6 +852,18 @@ def create_preference_batch_plan(
     )
 
 
+# Loop-invariant scalar constants used by the loss helpers below. Hoisted to
+# module scope so each loss call reuses the same mx.array instead of
+# reallocating an identical singleton every call.
+_SUPERVISED_TOKENS_ONE = mx.array(1)
+_SUPERVISED_TOKENS_ZERO = mx.array(0)
+_ORPO_LOG_ODDS_FLOOR = mx.array(1e-12, dtype=mx.float32)
+# _log_sigmoid's zero constant depends on the caller's dtype; cache one
+# singleton per dtype the first time it's seen instead of reallocating on
+# every call for a dtype we've already built.
+_LOG_SIGMOID_ZERO_CACHE = {}
+
+
 def _response_mask(targets, lengths):
     steps = mx.arange(1, targets.shape[1] + 1)
     return mx.logical_and(
@@ -848,19 +874,23 @@ def _response_mask(targets, lengths):
 def _supervised_tokens(batch_data):
     lengths = batch_data[1]
     return mx.maximum(
-        lengths[:, 1] - mx.maximum(lengths[:, 0], mx.array(1)),
-        mx.array(0),
+        lengths[:, 1] - mx.maximum(lengths[:, 0], _SUPERVISED_TOKENS_ONE),
+        _SUPERVISED_TOKENS_ZERO,
     ).sum()
 
 
 def _log_sigmoid(value):
-    return -mx.logaddexp(mx.array(0.0, dtype=value.dtype), -value)
+    zero = _LOG_SIGMOID_ZERO_CACHE.get(value.dtype)
+    if zero is None:
+        zero = mx.array(0.0, dtype=value.dtype)
+        _LOG_SIGMOID_ZERO_CACHE[value.dtype] = zero
+    return -mx.logaddexp(zero, -value)
 
 
 def _orpo_log_odds(chosen, rejected):
     chosen = chosen.astype(mx.float32)
     rejected = rejected.astype(mx.float32)
-    floor = mx.array(1e-12, dtype=mx.float32)
+    floor = _ORPO_LOG_ODDS_FLOOR
     chosen_odds = chosen - mx.log(mx.maximum(-mx.expm1(chosen), floor))
     rejected_odds = rejected - mx.log(mx.maximum(-mx.expm1(rejected), floor))
     return chosen_odds - rejected_odds
@@ -1522,21 +1552,55 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
 
 
 def lora_modules_have_nonzero_delta(modules):
-    def has_values(value):
+    # Collect one "has nonzero values" scalar per lora tensor and evaluate
+    # them all in a single host sync instead of one mx.eval().item() per
+    # module. Tensors that are missing/shapeless (or otherwise fail) are
+    # treated as vacuously "has values" (True), matching the prior per-call
+    # short-circuit behavior of has_values().
+    modules = list(modules)
+    checks = []  # list of (module_index, "a" | "b", mx.array scalar)
+    fallback = {}  # (module_index, "a" | "b") -> bool, when no array check applies
+
+    def resolve(value):
         if value is not None and not hasattr(value, "shape"):
             value = getattr(value, "weight", None)
-        if value is None or not hasattr(value, "shape"):
-            return True
+        return value
+
+    for module_index, module in enumerate(modules):
+        for tag, raw_value in (("a", module.lora_a), ("b", module.lora_b)):
+            value = resolve(raw_value)
+            if value is None or not hasattr(value, "shape"):
+                fallback[(module_index, tag)] = True
+                continue
+            try:
+                checks.append((module_index, tag, mx.any(value != 0)))
+            except Exception:
+                fallback[(module_index, tag)] = True
+
+    results = {}
+    results.update(fallback)
+    if checks:
         try:
-            result = mx.any(value != 0)
-            mx.eval(result)
-            return bool(result.item())
+            scalars = [result for _, _, result in checks]
+            stacked = mx.stack(scalars)
+            mx.eval(stacked)
+            values = stacked.tolist()
+            for (module_index, tag, _), value in zip(checks, values):
+                results[(module_index, tag)] = bool(value)
         except Exception:
-            return True
+            # Fall back to the original per-tensor eval so one bad tensor
+            # in the batch can't mask the others; unresolved entries default
+            # to True, matching has_values()'s prior exception behavior.
+            for module_index, tag, result in checks:
+                try:
+                    mx.eval(result)
+                    results[(module_index, tag)] = bool(result.item())
+                except Exception:
+                    results[(module_index, tag)] = True
 
     return any(
-        has_values(module.lora_a) and has_values(module.lora_b)
-        for module in modules
+        results.get((module_index, "a"), True) and results.get((module_index, "b"), True)
+        for module_index in range(len(modules))
     )
 
 

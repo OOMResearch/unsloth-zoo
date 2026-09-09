@@ -65,6 +65,29 @@ def _get_memory_budget() -> int:
 _CHUNK_BUDGET: int | None = None
 _CHUNK_PLAN_CACHE_MAX_ENTRIES = 16
 
+# Cache of singleton mx.array chunk-start markers keyed by (vocab_size,
+# chunk_size), used by _forward_chunked_fused_finalize's Metal-kernel path.
+# These markers are loop-invariant for a fixed (vocab_size, chunk_size) pair,
+# so rebuilding the list every forward call is wasted allocation; memoize it
+# here instead.
+_CHUNK_START_MARKERS_CACHE: dict[tuple[int, int], list] = {}
+_CHUNK_START_MARKERS_CACHE_MAX_ENTRIES = 16
+
+
+def _get_chunk_start_markers(vocab_size: int, chunk_size: int) -> list:
+    key = (vocab_size, chunk_size)
+    cached = _CHUNK_START_MARKERS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    markers = [mx.array([v_start], dtype=mx.int32) for v_start in range(0, vocab_size, chunk_size)]
+    if len(_CHUNK_START_MARKERS_CACHE) >= _CHUNK_START_MARKERS_CACHE_MAX_ENTRIES:
+        # Simple unordered eviction: this cache is small and keyed by a
+        # handful of (vocab_size, chunk_size) pairs per run, so we don't
+        # need LRU ordering bookkeeping like the chunk-plan cache above.
+        _CHUNK_START_MARKERS_CACHE.pop(next(iter(_CHUNK_START_MARKERS_CACHE)))
+    _CHUNK_START_MARKERS_CACHE[key] = markers
+    return markers
+
 
 def _resolve_chunk_size(
     requested_chunk_size: int,
@@ -650,7 +673,7 @@ def _forward_chunked_fused_finalize(
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
-    chunk_starts = [mx.array([v_start], dtype=mx.int32) for v_start in range(0, vocab_size, chunk_size)]
+    chunk_starts = _get_chunk_start_markers(vocab_size, chunk_size)
     last_chunk_idx = len(chunk_starts) - 1
 
     for v_start in range(0, vocab_size, chunk_size):

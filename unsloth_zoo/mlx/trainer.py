@@ -7229,6 +7229,17 @@ class MLXTrainer:
         # updates; _distributed_should_stop() OR-reduces stop_requested at the
         # top so an early stop (external cancel or an HF stop callback that ran
         # on a subset of ranks) drains every rank together before the next collective.
+        # `batches` is fixed for the entire run (set once by _prepare_data
+        # before this loop and never reassigned inside it), so its type never
+        # changes from one microstep to the next; resolve the dispatch once
+        # here instead of re-running isinstance() on every microstep below.
+        # This only hoists the batch-source *type* check - it does not touch
+        # `_use_compile`/`_compile_scope`, which a DDP compile-fallback can
+        # still flip mid-loop, and both isinstance() call sites keep gating
+        # on those unchanged so a compile fallback still takes effect exactly
+        # where it did before.
+        _batches_is_finite_plan = isinstance(batches, _FINITE_BATCH_PLAN_TYPES)
+
         microstep = _resume_microstep
         self._global_step = _resume_step
         # Resuming mid-epoch re-enters an epoch whose boundary already passed, so
@@ -7274,7 +7285,7 @@ class MLXTrainer:
                     # retries all reuse this resolved stored index.
                     scheduled_index = (
                         batches.batch_index_for_visit(batch_idx)
-                        if isinstance(batches, _FINITE_BATCH_PLAN_TYPES)
+                        if _batches_is_finite_plan
                         else batch_idx % len(batches)
                     )
                     if (
@@ -7284,7 +7295,7 @@ class MLXTrainer:
                         )
                         # Phase-aware admission through the shared finite-plan
                         # protocol; a plan with no shape plan materializes unpadded.
-                        and isinstance(batches, _FINITE_BATCH_PLAN_TYPES)
+                        and _batches_is_finite_plan
                     ):
                         batch_data = batches.materialize(
                             scheduled_index,
