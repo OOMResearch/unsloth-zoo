@@ -8096,6 +8096,10 @@ class FastMLXModel:
 
         from .utils import apply_gather_qmm_nax_guard
         apply_gather_qmm_nax_guard()
+        # Fused causal-attention backward for training on NAX GPUs; a no-op
+        # elsewhere and outside trainer runs (see flash_attention.py).
+        from .flash_attention import install_flash_attention_backward
+        install_flash_attention_backward()
 
         chat_template = kwargs.pop("chat_template", None)
         patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
