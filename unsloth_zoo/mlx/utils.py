@@ -12123,6 +12123,57 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         )
 
 
+_PREPARE_DATASET_CACHE_MAX_ENTRIES = 8
+# Process-level cache of fully-formatted-and-tokenized CacheDataset objects,
+# keyed by a fingerprint of (tokenizer, formatting config, dataset content).
+# _prepare_dataset is called fresh on every MLXTrainer.train() -- a new
+# benchmark repetition, a hyperparameter sweep step, anything that retrains
+# in the same process -- and used to redo all formatting/tokenization work
+# even when the dataset, tokenizer, and config are byte-identical to a
+# previous call (docs/mlx_lm-OPTIMIZATION_PLAN.md item 3.1). A hit returns
+# the *same* CacheDataset object, so its own per-index cache
+# (mlx_lm.tuner.datasets.CacheDataset._proc_data) is already fully populated
+# once any caller has indexed every row once -- no extra plumbing needed for
+# that part.
+_PREPARE_DATASET_CACHE: dict[tuple, "object"] = {}
+
+
+def _prepare_dataset_cache_key(
+    rows, tokenizer, dataset_text_field, formatting_func,
+    chat_template, model_name, model_type, append_eos,
+):
+    """Cheap fingerprint of _prepare_dataset's actual inputs: tokenizer
+    identity, every formatting-affecting config value, and the *raw*
+    (un-rendered, un-tokenized) row content -- hashing raw string/dict
+    content is orders of magnitude cheaper than the chat-template
+    rendering and BPE tokenization it stands in for. formatting_func is
+    keyed by identity: the common case (same function object reused
+    across repeated calls, e.g. a benchmark harness's own repetitions, or
+    a hyperparameter sweep that builds its formatting_func once) gets real
+    cache hits; a fresh closure built per call (no two calls ever share an
+    id()) just never hits, which is correct, not silently wrong."""
+    fingerprint = []
+    for item in rows:
+        if isinstance(item, dict):
+            value = item.get(dataset_text_field)
+            if value is None:
+                value = item.get("messages")
+            fingerprint.append(repr(value) if value is not None else repr(item))
+        else:
+            fingerprint.append(repr(item))
+    return (
+        id(tokenizer),
+        dataset_text_field,
+        chat_template,
+        model_name,
+        model_type,
+        bool(append_eos),
+        id(formatting_func) if formatting_func is not None else None,
+        len(rows),
+        hash(tuple(fingerprint)),
+    )
+
+
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
                      formatting_func=None, chat_template=None,
                      model_name=None, model_type=None,
@@ -12142,9 +12193,25 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     chat-template rendering already includes EOS.
 
     Returns:
-        A CacheDataset ready for ``iterate_batches``.
+        A CacheDataset ready for ``iterate_batches``. Reuses a cached
+        instance (see _PREPARE_DATASET_CACHE) when this exact
+        tokenizer/config/content combination was already prepared earlier
+        in this process.
     """
     from mlx_lm.tuner.datasets import CacheDataset
+
+    # Materialized once, up front: a one-shot iterable (e.g. a generator)
+    # must only ever be consumed once, and both the cache-key fingerprint
+    # below and the formatting loop need to see the same rows.
+    dataset = list(dataset)
+
+    cache_key = _prepare_dataset_cache_key(
+        dataset, tokenizer, dataset_text_field, formatting_func,
+        chat_template, model_name, model_type, append_eos,
+    )
+    cached = _PREPARE_DATASET_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     normalize_mlx_chat_template(
         tokenizer,
@@ -12208,9 +12275,17 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
         def __len__(self):
             return len(self._data)
 
-    return CacheDataset(
+    result = CacheDataset(
         _StudioTextDataset(formatted, tokenizer, text_key="text", eos_id=_eos_id)
     )
+    if len(_PREPARE_DATASET_CACHE) >= _PREPARE_DATASET_CACHE_MAX_ENTRIES:
+        # Simple unordered eviction, same as the CCE chunk-marker cache in
+        # cce/runtime_cce.py: this cache is small and keyed by a handful of
+        # distinct (tokenizer, config, dataset) combinations per process, so
+        # LRU ordering bookkeeping isn't worth it.
+        _PREPARE_DATASET_CACHE.pop(next(iter(_PREPARE_DATASET_CACHE)))
+    _PREPARE_DATASET_CACHE[cache_key] = result
+    return result
 
 
 def _create_default_text_plan(
