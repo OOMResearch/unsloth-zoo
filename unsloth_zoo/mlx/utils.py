@@ -983,6 +983,24 @@ def _tie_to_hidden_state(args, shared_kv):
     return (x, *args[1:]), shared_kv
 
 
+# Instance attribute marking a layer that runs un-checkpointed even though its
+# class is patched. `__call__` resolves on the type, so the patch itself has to
+# stay per-class; this is what makes checkpointing selectable per layer.
+_GC_SKIP_ATTR = "_unsloth_gc_skip"
+
+
+def _checkpointed_layer_indices(num_layers, ratio):
+    """Indices of the `round(num_layers * ratio)` layers to checkpoint, evenly
+    spaced so no long run of layers stores its activations back to back."""
+    ratio = float(ratio)
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(
+            f"Unsloth: gradient_checkpointing_ratio must be in (0, 1], got {ratio}. "
+            "Set gradient_checkpointing=False to checkpoint nothing.")
+    count = min(num_layers, max(1, round(num_layers * ratio)))
+    return {((2 * i + 1) * num_layers) // (2 * count) for i in range(count)}
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -990,6 +1008,8 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
+        if self.__dict__.get(_GC_SKIP_ATTR):
+            return fn(self, *args, **kwargs)
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         if slot is None:
             if "shared_kv" in kwargs:
@@ -1035,16 +1055,24 @@ def _unpatch_layer_class_gc(layer_cls):
         del layer_cls._orig_call
 
 
-def apply_gradient_checkpointing(model):
+def apply_gradient_checkpointing(model, ratio=1.0):
     """Apply gradient checkpointing to language and vision tower layers.
 
     Patches each layer class's ``__call__`` with ``mx.checkpoint`` to recompute
     the forward during backward instead of storing activations. Trades ~30%
     extra compute for large memory savings — critical for VLM vision towers at
     native resolution, which can otherwise materialize tens of GB.
+
+    ``ratio`` is the fraction of language layers checkpointed, evenly spaced;
+    the rest store their activations and skip the recompute, so both the
+    compute cost and the memory saving scale with it. Vision tower layers are
+    always all checkpointed.
     """
     lm_layers = _get_transformer_layers(model)
     if lm_layers is not None and len(lm_layers) > 0:
+        checkpointed = _checkpointed_layer_indices(len(lm_layers), ratio)
+        for index, layer in enumerate(lm_layers):
+            _set_gc_skip(layer, index not in checkpointed)
         _patch_layer_class_for_gc(type(lm_layers[0]))
 
     vt_layers = _get_vision_encoder_layers(model)
@@ -1052,10 +1080,20 @@ def apply_gradient_checkpointing(model):
         _patch_layer_class_for_gc(type(vt_layers[0]))
 
 
+def _set_gc_skip(layer, skip):
+    if skip:
+        # object.__setattr__: a plain flag, never a module parameter.
+        object.__setattr__(layer, _GC_SKIP_ATTR, True)
+    else:
+        layer.__dict__.pop(_GC_SKIP_ATTR, None)
+
+
 def remove_gradient_checkpointing(model):
     """Remove gradient checkpointing, restoring original layer __call__."""
     lm_layers = _get_transformer_layers(model)
     if lm_layers is not None and len(lm_layers) > 0:
+        for layer in lm_layers:
+            _set_gc_skip(layer, False)
         _unpatch_layer_class_gc(type(lm_layers[0]))
     vt_layers = _get_vision_encoder_layers(model)
     if vt_layers is not None and len(vt_layers) > 0:

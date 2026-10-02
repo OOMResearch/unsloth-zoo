@@ -1479,6 +1479,7 @@ class MLXTrainingConfig:
     compile_auto_tune: bool = True
     compile_trace: bool = True
     gradient_checkpointing: bool = True
+    gradient_checkpointing_ratio: float = 1.0  # Fraction of language layers checkpointed, in (0, 1]; lower trades memory for speed
     streaming: bool = False  # Lazily consume unsized text/VLM sources
     dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
     preserve_dataset_order: bool = False  # Match Unsloth CUDA SequentialSampler order
@@ -5582,8 +5583,14 @@ class MLXTrainer:
                 )
 
             if args.gradient_checkpointing:
-                apply_gradient_checkpointing(model)
-                _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
+                _gc_ratio = float(getattr(args, "gradient_checkpointing_ratio", 1.0))
+                apply_gradient_checkpointing(model, ratio=_gc_ratio)
+                _main_print(
+                    "Unsloth: Using gradient checkpointing to reduce memory."
+                    if _gc_ratio >= 1.0 else
+                    f"Unsloth: Using gradient checkpointing on {_gc_ratio:.0%} of "
+                    "language layers to reduce memory."
+                )
 
             # Keeps routers, gather-sort and sparse block selection differentiable,
             # and marks the process as inside a training run.
@@ -10534,7 +10541,8 @@ class MLXKTOTrainer(MLXTrainer):
         try:
             self._memory_limits_applied = self._configure_memory_limits()
             if args.gradient_checkpointing:
-                apply_gradient_checkpointing(model)
+                apply_gradient_checkpointing(
+                    model, ratio=getattr(args, "gradient_checkpointing_ratio", 1.0))
                 checkpointed = True
             acquire_mlx_training_patches()
             patched = True
