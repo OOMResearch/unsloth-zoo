@@ -12138,6 +12138,27 @@ _PREPARE_DATASET_CACHE_MAX_ENTRIES = 8
 _PREPARE_DATASET_CACHE: dict[tuple, "object"] = {}
 
 
+def _tokenizer_identity_key(tokenizer):
+    """A cache-key-safe tokenizer identity. `id(tokenizer)` is wrong here:
+    the common case this cache targets -- a benchmark harness's repeated
+    repetitions, a hyperparameter sweep -- reloads "the same" tokenizer via
+    a fresh `from_pretrained(...)` call every time, which returns a new
+    object with a new id() even though it's the identical tokenizer on
+    disk. `name_or_path` (the resolved snapshot path/repo id) is stable
+    across such reloads, confirmed for real: two separate
+    `FastMLXModel.from_pretrained("Qwen/Qwen2.5-0.5B")` calls return
+    different TokenizerWrapper objects with the same `name_or_path`.
+    `vocab_size` is included too, cheaply, in case two different models
+    ever happened to resolve to the same path string. Falls back to raw
+    object identity only when `name_or_path` isn't set at all (e.g. a
+    tokenizer built in memory, not loaded from a path) -- conservative,
+    never a false hit."""
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if not name_or_path:
+        return ("id", id(tokenizer))
+    return ("name", name_or_path, getattr(tokenizer, "vocab_size", None))
+
+
 def _prepare_dataset_cache_key(
     rows, tokenizer, dataset_text_field, formatting_func,
     chat_template, model_name, model_type, append_eos,
@@ -12162,7 +12183,7 @@ def _prepare_dataset_cache_key(
         else:
             fingerprint.append(repr(item))
     return (
-        id(tokenizer),
+        _tokenizer_identity_key(tokenizer),
         dataset_text_field,
         chat_template,
         model_name,

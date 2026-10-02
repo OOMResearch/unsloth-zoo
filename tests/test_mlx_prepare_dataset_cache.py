@@ -17,6 +17,20 @@ class _FakeTokenizer:
     eos_token_id = 99
 
 
+class _FakeNamedTokenizer:
+    """Stands in for mlx_lm.tokenizer_utils.TokenizerWrapper: a real
+    tokenizer reloaded via a fresh from_pretrained(...) call gets a new
+    object (new id()) but the same name_or_path -- confirmed for real
+    against two separate FastMLXModel.from_pretrained("Qwen/Qwen2.5-0.5B")
+    calls. Each instance here is deliberately distinct (no shared id())."""
+
+    eos_token_id = 99
+
+    def __init__(self, name_or_path, vocab_size=1000):
+        self.name_or_path = name_or_path
+        self.vocab_size = vocab_size
+
+
 @pytest.fixture(autouse=True)
 def _clear_prepare_dataset_cache():
     mlx_utils._PREPARE_DATASET_CACHE.clear()
@@ -70,9 +84,43 @@ def test_different_content_misses_cache(_stub_tokenizer_helpers):
 
 
 def test_different_tokenizer_identity_misses_cache(_stub_tokenizer_helpers):
+    """Two tokenizer objects with no name_or_path fall back to raw
+    identity -- a real cache miss, not a silent false hit."""
     rows = [{"text": "hello"}]
     first = mlx_utils._prepare_dataset(list(rows), _FakeTokenizer(), dataset_text_field="text")
     second = mlx_utils._prepare_dataset(list(rows), _FakeTokenizer(), dataset_text_field="text")
+    assert second is not first
+    assert _stub_tokenizer_helpers["collect"] == 2
+
+
+def test_reloaded_tokenizer_with_same_name_or_path_hits_cache(_stub_tokenizer_helpers):
+    """Regression test for a real bug found while validating this cache
+    through the actual harness (docs/mlx_lm-OPTIMIZATION_PLAN.md item 3.1,
+    2026-10-01): a benchmark harness rebuilds the model/tokenizer fresh
+    every repetition, so id(tokenizer) differs every single call even
+    though it's "the same" tokenizer reloaded -- keying on raw identity
+    made every repetition a guaranteed cache miss, defeating the cache
+    for its primary intended use case. name_or_path is stable across such
+    reloads; two distinct objects sharing it must still hit."""
+    rows = [{"text": "hello"}]
+    first = mlx_utils._prepare_dataset(
+        list(rows), _FakeNamedTokenizer("Qwen/Qwen2.5-0.5B"), dataset_text_field="text"
+    )
+    second = mlx_utils._prepare_dataset(
+        list(rows), _FakeNamedTokenizer("Qwen/Qwen2.5-0.5B"), dataset_text_field="text"
+    )
+    assert second is first
+    assert _stub_tokenizer_helpers["collect"] == 1
+
+
+def test_different_name_or_path_misses_cache(_stub_tokenizer_helpers):
+    rows = [{"text": "hello"}]
+    first = mlx_utils._prepare_dataset(
+        list(rows), _FakeNamedTokenizer("Qwen/Qwen2.5-0.5B"), dataset_text_field="text"
+    )
+    second = mlx_utils._prepare_dataset(
+        list(rows), _FakeNamedTokenizer("Qwen/Qwen3-0.6B"), dataset_text_field="text"
+    )
     assert second is not first
     assert _stub_tokenizer_helpers["collect"] == 2
 
