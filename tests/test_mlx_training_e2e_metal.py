@@ -9,14 +9,16 @@ functions (CCE and baseline).
 
 import glob
 import json
+import math
 import os
+from typing import ClassVar
 
 import pytest
 
 try:
     import mlx.core as mx
     _METAL = mx.metal.is_available()
-except Exception:
+except (ImportError, RuntimeError, AttributeError, OSError):
     _METAL = False
 
 if not _METAL:
@@ -25,20 +27,29 @@ if not _METAL:
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 _K_REM, _ROW_OVF = "k_remainder", "row_overflow"
-_UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=None)
+_UNTRANSPOSED = {
+    "k": 192,
+    "rows": 1,
+    "out_width": 128,
+    "transpose": False,
+    "rhs_indices": None,
+}
 
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
-    import mlx.nn as nn
     import mlx.optimizers as optim
+    from mlx import nn
     from mlx.utils import tree_flatten, tree_map
+    from unsloth_zoo.mlx import utils as mlx_utils
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
-    from unsloth_zoo.mlx import utils as mlx_utils
     from unsloth_zoo.mlx.utils import (
-        FiniteTextBatchPlan, _FiniteTextRow, collect_mlx_lora_adapter_tensors,
+        FiniteTextBatchPlan,
+        _FiniteTextRow,
+        collect_mlx_lora_adapter_tensors,
         make_baseline_loss_fn,
     )
+
     _U, _CPU = lambda *s: mx.zeros(s, dtype=mx.uint32), mx.default_stream(mx.cpu)
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
@@ -52,13 +63,24 @@ def test_cacheless_text_positions_match_language_wrapper(family):
 
     configs = importlib.import_module(f"mlx_vlm.models.{family}.config")
     language = importlib.import_module(f"mlx_vlm.models.{family}.language")
-    args = configs.TextConfig.from_dict(dict(
-        model_type=family, hidden_size=512, num_hidden_layers=2,
-        intermediate_size=128, num_attention_heads=4, num_key_value_heads=2,
-        rms_norm_eps=1e-5, vocab_size=32, max_position_embeddings=128,
-        rope_scaling={"type": "default", "rope_type": "default",
-                      "mrope_section": [8, 12, 12] if family == "glm4v" else [16, 24, 24]},
-    ))
+    args = configs.TextConfig.from_dict(
+        {
+            "model_type": family,
+            "hidden_size": 512,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "rope_scaling": {
+                "type": "default",
+                "rope_type": "default",
+                "mrope_section": [8, 12, 12] if family == "glm4v" else [16, 24, 24],
+            },
+        }
+    )
     config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2),
                              image_token_id=40, video_token_id=41, vision_start_token_id=42)
     lm = language.LanguageModel(args, config)
@@ -97,23 +119,56 @@ def test_cached_position_attribute_does_not_imply_multiaxis_rope():
 @metal_only
 def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
     import importlib
+
     from unsloth_zoo.mlx import loader
 
     try:
         module = importlib.import_module("mlx_vlm.models.minicpmv4_7.minicpmv4_7")
     except ImportError:
         pytest.skip("mlx-vlm has no MiniCPM-V 4.7")
-    text = dict(model_type="qwen3_5_text", hidden_size=64, intermediate_size=64, num_hidden_layers=2,
-                num_attention_heads=2, num_key_value_heads=1, head_dim=32, rms_norm_eps=1e-6,
-                vocab_size=64, full_attention_interval=2, linear_num_key_heads=1,
-                linear_num_value_heads=1, linear_key_head_dim=32, linear_value_head_dim=32,
-                rope_parameters={"mrope_interleaved": True, "mrope_section": [2, 1, 1],
-                                 "rope_theta": 1e7, "partial_rotary_factor": 0.25})
-    vision = dict(hidden_size=32, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2)
-    config = module.ModelConfig.from_dict(dict(
-        model_type="minicpmv4_7", text_config=text, vision_config=vision, insert_layer_id=0,
-        image_token_id=56, video_token_id=57, image_start_id=58, image_end_id=59,
-        slice_start_id=60, slice_end_id=61, newline_id=62))
+    text = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 64,
+        "full_attention_interval": 2,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 32,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [2, 1, 1],
+            "rope_theta": 1e7,
+            "partial_rotary_factor": 0.25,
+        },
+    }
+    vision = {
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+    }
+    config = module.ModelConfig.from_dict(
+        {
+            "model_type": "minicpmv4_7",
+            "text_config": text,
+            "vision_config": vision,
+            "insert_layer_id": 0,
+            "image_token_id": 56,
+            "video_token_id": 57,
+            "image_start_id": 58,
+            "image_end_id": 59,
+            "slice_start_id": 60,
+            "slice_end_id": 61,
+            "newline_id": 62,
+        }
+    )
     installed = module.Model.get_input_embeddings
     upstream = getattr(installed, "__wrapped__", installed)
     monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
@@ -159,6 +214,7 @@ def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
 @metal_only
 def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
     from types import SimpleNamespace
+
     from mlx_vlm.models.qwen3_vl.vision import VisionModel
     from unsloth_zoo.mlx import compile as mc
 
@@ -181,6 +237,7 @@ def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
 @pytest.mark.parametrize("static", [False, True])
 def test_native_vlm_names_preserve_source_remaps_and_transforms(monkeypatch, static):
     import inspect
+
     from unsloth_zoo.mlx import loader
 
     class RenamingModel(nn.Module):
@@ -225,8 +282,8 @@ def test_native_vlm_names_preserve_source_remaps_and_transforms(monkeypatch, sta
 @metal_only
 @pytest.mark.parametrize("per_layer", [False, True])
 def test_recurrent_language_layers_receive_one_adapter_each(per_layer):
-    from unsloth_zoo.mlx.loader import linear_to_lora_layers
     from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers
 
     class Layer(nn.Module):
         def __init__(self):
@@ -244,7 +301,7 @@ def test_recurrent_language_layers_receive_one_adapter_each(per_layer):
             return [self.low, self.low, self.high, self.low, self.high]
 
     model = RecurrentModel()
-    config = dict(keys=["q_proj"], rank=2, scale=2, dropout=0)
+    config = {"keys": ["q_proj"], "rank": 2, "scale": 2, "dropout": 0}
     if per_layer:
         config.update(keys=["q_proj", "v_proj"],
                       layer_keys=[["q_proj"], ["q_proj"], ["v_proj"], ["q_proj"], ["v_proj"]])
@@ -343,16 +400,26 @@ def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
 def test_windowed_attention_trains_kv_shared_gemma(monkeypatch, family, T):
     # gemma3n shares K/V through the zoo's slots, gemma4 through mlx-vlm itself.
     import importlib
+
     from mlx.utils import tree_flatten
 
     config_module = importlib.import_module(f"mlx_vlm.models.{family}.config")
     language = importlib.import_module(f"mlx_vlm.models.{family}.language")
     mx.random.seed(0)
     layers, types = 15, (["sliding_attention"] * 4 + ["full_attention"]) * 3
-    shape = dict(
-        num_hidden_layers=layers, num_kv_shared_layers=10, sliding_window=512, layer_types=types,
-        hidden_size=64, head_dim=32, num_attention_heads=2, num_key_value_heads=1,
-        hidden_size_per_layer_input=16, vocab_size=512, vocab_size_per_layer_input=512)
+    shape = {
+        "num_hidden_layers": layers,
+        "num_kv_shared_layers": 10,
+        "sliding_window": 512,
+        "layer_types": types,
+        "hidden_size": 64,
+        "head_dim": 32,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "hidden_size_per_layer_input": 16,
+        "vocab_size": 512,
+        "vocab_size_per_layer_input": 512,
+    }
     if family == "gemma4":
         shape.update(intermediate_size=128, global_head_dim=64)
     else:
@@ -407,17 +474,17 @@ def _dataset(n=24):
 def _train(tmp_path, **config_overrides):
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
     model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
-    config = dict(
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=1,
-        max_steps=8,
-        warmup_steps=2,
-        learning_rate=5e-4,
-        logging_steps=1,
-        output_dir=str(tmp_path),
-        seed=3407,
-        report_to="none",
-    )
+    config = {
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 1,
+        "max_steps": 8,
+        "warmup_steps": 2,
+        "learning_rate": 5e-4,
+        "logging_steps": 1,
+        "output_dir": str(tmp_path),
+        "seed": 3407,
+        "report_to": "none",
+    }
     config.update(config_overrides)
     trainer = MLXTrainer(
         model=model,
@@ -433,7 +500,7 @@ def _assert_history(trainer, min_steps):
     hist = trainer._train_loss_history
     assert len(hist) >= min_steps, f"only {len(hist)} logged losses"
     assert all(
-        isinstance(l, float) and l == l and abs(l) != float("inf") for l in hist
+        isinstance(loss, float) and math.isfinite(loss) for loss in hist
     ), f"non-finite losses: {hist}"
     return hist
 
@@ -454,7 +521,7 @@ def _callback_trainer(
     with_eval=False,
 ):
     """Create a minimal MLXTrainer with prebuilt batches for callback tests."""
-    import mlx.nn as nn
+    from mlx import nn
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class TinyLM(nn.Module):
@@ -549,7 +616,7 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
             self.events.append(("eval", state.global_step))
 
     class ClassCallback(TrainerCallback):
-        calls = []
+        calls: ClassVar[list[int]] = []
 
         def on_train_begin(self, args, state, control, **_kwargs):
             type(self).calls.append(state.global_step)
@@ -596,8 +663,9 @@ def test_eval_reports_mean_token_accuracy_on_metal(tmp_path):
 @metal_only
 def test_hf_callback_on_save_only_fires_for_checkpoints(tmp_path, monkeypatch):
     from pathlib import Path
-    from transformers import TrainerCallback
+
     import unsloth_zoo.mlx.trainer as mlx_trainer
+    from transformers import TrainerCallback
 
     class SaveRecorder(TrainerCallback):
         def __init__(self):
@@ -814,6 +882,7 @@ _NormTok = type("Tok", (), {"pad_token_id": 0, "eos_token_id": 0})
 
 def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0):
     from types import SimpleNamespace
+
     from mlx_lm.tuner.lora import LoRALinear
     from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap
 
@@ -864,8 +933,9 @@ def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
-    import numpy as np
     from types import SimpleNamespace
+
+    import numpy as np
     from mlx.utils import tree_flatten
 
     class Backbone(nn.Module):
@@ -975,6 +1045,7 @@ def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
 @pytest.mark.parametrize("softcap", [0.0, 7.0])
 def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
     import gc
+
     from unsloth_zoo.mlx.cce import runtime_cce
     from unsloth_zoo.mlx.cce.runtime_cce import make_chunked_cross_entropy_loss
 
@@ -1004,15 +1075,35 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
         hidden.astype(mx.float32)
     )
     mx.eval(expected, actual, precomputed, exact)
-    for left, right in zip(expected, actual):
-        assert mx.array_equal(left, right).item()
+    if softcap == 0.0:
+
+        def native(h):
+            logits = h @ weight.T
+            losses = nn.losses.cross_entropy(logits, mx.maximum(targets, 0)).astype(
+                mx.float32
+            )
+            return (losses * mx.where(targets != -100, cotangent, 0.0)).sum()
+
+        native_gradient = mx.grad(native)
+        if compiled:
+            native_gradient = mx.compile(native_gradient)
+        assert mx.allclose(
+            actual[1], native_gradient(hidden), atol=1e-6, rtol=1e-2
+        ).item()
+        assert mx.array_equal(actual[0], expected[0]).item()
+        assert mx.array_equal(actual[1], precomputed[1]).item()
+    else:
+        for left, right in zip(expected, actual):
+            assert mx.array_equal(left, right).item()
     assert mx.array_equal(precomputed[0], expected[0]).item()
-    assert mx.allclose(precomputed[1].astype(mx.float32), exact, atol=2e-3, rtol=0).item()
+    assert mx.allclose(
+        precomputed[1].astype(mx.float32), exact, atol=2e-3, rtol=0
+    ).item()
     # Held until the backward, the gradient is stored at the hidden dtype.
-    assert stored == [mx.bfloat16]
+    assert stored == ([] if softcap == 0.0 else [mx.bfloat16])
     assert mx.all(actual[1][::5] == 0).item()
     assert mx.any(actual[1][1:] > 0).item() and mx.any(actual[1][1:] < 0).item()
-    del expected, actual, precomputed, exact, left, right
+    del expected, actual, precomputed, exact
     # Head-only peaks cover the release; precomputing saves memory only across a compiled model step.
     peaks = []
     for fn in functions[:2]:
@@ -1033,6 +1124,7 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
 def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
     import gc
     import weakref
+
     from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
 
     shape = (2048, 8192)
@@ -1054,8 +1146,13 @@ def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
             opt = cls(learning_rate=1e-3, weight_decay=0.0, bias_correction=True)
         opt.init(params)
         state = [params, opt.state]
-        step = mx.compile(lambda g: params.update(opt.apply_gradients({"w": g}, params)),
-                          inputs=state, outputs=state)
+        step = mx.compile(
+            lambda g, params=params, opt=opt: params.update(
+                opt.apply_gradients({"w": g}, params)
+            ),
+            inputs=state,
+            outputs=state,
+        )
         mx.eval(state, grads)
         for g in grads:
             gc.collect()
@@ -1082,6 +1179,7 @@ def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
 @metal_only
 def test_layer_ordered_update_frees_gradients_during_backward():
     import gc
+
     from unsloth_zoo.mlx.trainer import _async_eval_by_layer, _donate_optimizer_state
 
     class Net(nn.Module):
@@ -1109,7 +1207,7 @@ def test_layer_ordered_update_frees_gradients_during_backward():
         grad_fn = nn.value_and_grad(model, lambda m, x: m(x).astype(mx.float32).square().mean())
         state = [model.state, opt.state]
 
-        def step(x):
+        def step(x, grad_fn=grad_fn, model=model, opt=opt):
             loss, grads = grad_fn(model, x)
             opt.update(model, grads)
             return loss
@@ -1299,9 +1397,13 @@ def _norm_batches(count):
 
 
 _CLIP = {
-    "none": dict(max_grad_norm=0.0, max_grad_value=0.0, max_grad_leaf_norm=0.0),
-    "leaf": dict(max_grad_norm=0.0, max_grad_value=None, max_grad_leaf_norm=0.01),
-    "global": dict(max_grad_norm=0.01, max_grad_value=None, max_grad_leaf_norm=None),
+    "none": {"max_grad_norm": 0.0, "max_grad_value": 0.0, "max_grad_leaf_norm": 0.0},
+    "leaf": {"max_grad_norm": 0.0, "max_grad_value": None, "max_grad_leaf_norm": 0.01},
+    "global": {
+        "max_grad_norm": 0.01,
+        "max_grad_value": None,
+        "max_grad_leaf_norm": None,
+    },
 }
 
 
@@ -1354,7 +1456,7 @@ def _oracle_norm(batches, seed=77):
     acc, toks = None, mx.array(0.0, dtype=mx.float32)
     for batch in batches:
         (_l, n), grad = nn.value_and_grad(model, make_baseline_loss_fn())(model, *batch)
-        weighted = tree_map(lambda g: g * n.astype(g.dtype), grad)
+        weighted = tree_map(lambda g, n=n: g * n.astype(g.dtype), grad)
         acc = weighted if acc is None else tree_map(lambda a, b: a + b, acc, weighted)
         toks = toks + n.astype(mx.float32)
     sq = mx.array(0.0, dtype=mx.float32)
@@ -1564,8 +1666,8 @@ def _adapter_keys(model):
 
 def _tiny_base(path):
     """Write a tiny unquantized HF Llama + tokenizer to ``path``."""
-    import torch
-    from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
     # vocab_size matches hf-internal-testing/llama-tokenizer so token ids stay
     # in range (Metal indexing is unchecked).
     cfg = LlamaConfig(
@@ -1706,9 +1808,7 @@ def test_resume_from_adapter_dir_names_warm_start(tmp_path, prefetch):
     # Single-process streaming prefetch reads resume state early, before the
     # main resume block; that read must not pre-empt the completeness check
     # with a raw FileNotFoundError for trainer_state.json.
-    extra = (
-        dict(streaming=True, streaming_prefetch_batches=2) if prefetch else {}
-    )
+    extra = {"streaming": True, "streaming_prefetch_batches": 2} if prefetch else {}
     cfg = MLXTrainingConfig(
         output_dir=str(tmp_path / "out"), per_device_train_batch_size=2,
         max_steps=2, learning_rate=1e-3, compile=False, use_cce=False,
@@ -1779,8 +1879,9 @@ def _record_cce_rows(monkeypatch):
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
 def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, reference, prompt_share, dtype, kind):
-    from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
+    from unsloth_zoo.mlx import preference as p
+
     mx.random.seed(937)
     kernel_rows, calls = _record_cce_rows(monkeypatch), []
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
@@ -1846,9 +1947,17 @@ def test_backbone_stack_hidden_states_and_cce_match_the_logits(family, tied):
     import importlib
 
     mod = importlib.import_module(f"mlx_lm.models.{family}")
-    common = dict(model_type=family, vocab_size=128, hidden_size=64, intermediate_size=128,
-                  layer_norm_epsilon=1e-5, conv_kernel=4, n_groups=1, use_bias=False,
-                  use_conv_bias=True)
+    common = {
+        "model_type": family,
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "layer_norm_epsilon": 1e-5,
+        "conv_kernel": 4,
+        "n_groups": 1,
+        "use_bias": False,
+        "use_conv_bias": True,
+    }
     if family == "nemotron_h":
         args = mod.ModelArgs(
             **common, max_position_embeddings=256, num_attention_heads=4,
@@ -1889,7 +1998,8 @@ def test_backbone_stack_hidden_states_and_cce_match_the_logits(family, tied):
 @pytest.mark.parametrize("frozen", [False, True])
 def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
     """A trainable-declared head may compute its weight gradient despite stop_gradient."""
-    from unsloth_zoo.mlx import preference as p, utils
+    from unsloth_zoo.mlx import preference as p
+    from unsloth_zoo.mlx import utils
 
     model = _cce_text_model(2053, 64, quantized=False)
     if frozen:
@@ -1905,8 +2015,9 @@ def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 @pytest.mark.parametrize("loss_type", ["kto", "apo_zero_unpaired"])
 def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
-    from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
+    from unsloth_zoo.mlx import preference as p
+
     mx.random.seed(941)
     calls = []
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
@@ -1943,7 +2054,6 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
     assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
 
 
-
 @metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 def test_grpo_cce_scores_like_the_logits(head):
@@ -1953,7 +2063,15 @@ def test_grpo_cce_scores_like_the_logits(head):
     model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls, softcap=0.5 if head == "softcap" else 0.0)
     tokens = (mx.arange(4 * 48).reshape(4, 48) * 7 + 3) % 2053
     old = g.completion_logps(model, tokens, 0.7) + 0.05
-    batch = (tokens, mx.array([[5, 48], [9, 40], [13, 33], [3, 48]]), mx.array([2.0, 100.0]), mx.array([1.0, -1.0, 0.5, -0.5]), mx.array([1, 1, 0, 1]), old, old - 0.1)  # noqa: E501
+    batch = (
+        tokens,
+        mx.array([[5, 48], [9, 40], [13, 33], [3, 48]]),
+        mx.array([2.0, 100.0]),
+        mx.array([1.0, -1.0, 0.5, -0.5]),
+        mx.array([1, 1, 0, 1]),
+        old,
+        old - 0.1,
+    )
     mx.eval(expected := nn.value_and_grad(model, g.make_grpo_loss_fn(objective))(model, *batch))
     calls.clear()
     cce = g.make_grpo_cce_loss_fn(model, objective)
@@ -1968,6 +2086,7 @@ def test_grpo_cce_scores_like_the_logits(head):
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
     from types import SimpleNamespace
+
     import numpy as np
 
     rows = []
@@ -2040,7 +2159,7 @@ def test_preference_logit_sums_keep_float32_precision(quantized):
     weight = (mx.random.normal((8192, 64)) * 0.5).astype(mx.bfloat16)
     head, quantization = (weight, None, None), {}
     if quantized:
-        quantization = dict(group_size=64, bits=4, mode="affine")
+        quantization = {"group_size": 64, "bits": 4, "mode": "affine"}
         head = mx.quantize(weight, group_size=64, bits=4)
         weight = mx.dequantize(*head, group_size=64, bits=4)
     expected = (hidden.astype(mx.float32) @ weight.astype(mx.float32).T).sum(axis=-1)
@@ -2055,6 +2174,7 @@ def test_preference_logit_sums_keep_float32_precision(quantized):
 @pytest.mark.parametrize("kind", ["dpo", "orpo", "cpo"])
 def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, dtype, kind):
     from types import SimpleNamespace
+
     from mlx_lm.tuner.lora import LoRAEmbedding
     from unsloth_zoo.mlx import preference as p
 
@@ -2175,8 +2295,9 @@ def test_vlm_cce_small_capacity_admission_and_rebuilds():
 @pytest.mark.parametrize("quantized", [False, True])
 def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
     from types import SimpleNamespace
-    from unsloth_zoo.mlx.trainer import MLXTrainer
+
     from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.trainer import MLXTrainer
 
     # The 256-row capacity is admitted only when it shares vocabulary chunks with
     # the half capacity, and that limit is derived from _get_memory_budget(), which
@@ -2256,8 +2377,8 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     import sys as _sys
     import types
 
-    import mlx.nn as nn
     import unsloth_zoo.mlx.trainer as trainer_mod
+    from mlx import nn
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -2544,9 +2665,11 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
     LanguageModelOutput where mlx_lm models return the array. Every loss that
     feeds a model call to cross-entropy has to accept both."""
     import mlx.core as mx
-
     from unsloth_zoo.mlx.preference import (
-        make_dpo_loss_fn, make_orpo_loss_fn, resolve_preference_objective)
+        make_dpo_loss_fn,
+        make_orpo_loss_fn,
+        resolve_preference_objective,
+    )
     from unsloth_zoo.mlx.utils import make_baseline_loss_fn
 
     vocab = 8
@@ -2688,22 +2811,34 @@ def raw_gather_qmm(monkeypatch):
 
 
 @metal_only
-@pytest.mark.parametrize("case, expected", [
-    (dict(k=96), (_K_REM,)),
-    (dict(k=64, rows=32769), (_ROW_OVF,)),
-    (dict(k=96, rows=32769), (_K_REM, _ROW_OVF)),
-    (dict(k=96, sorted_indices=False), ()),
-    (dict(k=96, lhs_indices=_U(64, 1)), ()),
-    (dict(k=96, rhs_indices=None, lhs_indices=_U(64, 1)), ()),
-    (dict(k=96, m=2), ()),
-    (dict(k=96, stream=_CPU), ()),
-    (dict(k=192, out_width=96, transpose=False), (_K_REM,)),
-    (dict(k=192, out_width=96, pack_bits=8, bits=None, mode="mxfp8", transpose=False),
-     (_K_REM,)),
-    ({**_UNTRANSPOSED, "rows": 32769, "rhs_indices": _U(1)}, (_ROW_OVF,)),
-    ({**_UNTRANSPOSED, "lhs_indices": _U(4097, 1)}, (_ROW_OVF,)),
-    ({**_UNTRANSPOSED, "lhs_indices": _U(4096, 8)}, ()),
-])
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ({"k": 96}, (_K_REM,)),
+        ({"k": 64, "rows": 32769}, (_ROW_OVF,)),
+        ({"k": 96, "rows": 32769}, (_K_REM, _ROW_OVF)),
+        ({"k": 96, "sorted_indices": False}, ()),
+        ({"k": 96, "lhs_indices": _U(64, 1)}, ()),
+        ({"k": 96, "rhs_indices": None, "lhs_indices": _U(64, 1)}, ()),
+        ({"k": 96, "m": 2}, ()),
+        ({"k": 96, "stream": _CPU}, ()),
+        ({"k": 192, "out_width": 96, "transpose": False}, (_K_REM,)),
+        (
+            {
+                "k": 192,
+                "out_width": 96,
+                "pack_bits": 8,
+                "bits": None,
+                "mode": "mxfp8",
+                "transpose": False,
+            },
+            (_K_REM,),
+        ),
+        ({**_UNTRANSPOSED, "rows": 32769, "rhs_indices": _U(1)}, (_ROW_OVF,)),
+        ({**_UNTRANSPOSED, "lhs_indices": _U(4097, 1)}, (_ROW_OVF,)),
+        ({**_UNTRANSPOSED, "lhs_indices": _U(4096, 8)}, ()),
+    ],
+)
 def test_gather_qmm_guard_predicate(case, expected):
     """4097 lhs indices over 8 experts broadcast to 32776 rows; 4096 x 8 is 32768."""
     assert (mlx_utils._MLX_MAX_SORTED_ROWS, mlx_utils._MLX_K_REMAINDER) == (32768, _K_REM)
@@ -2765,7 +2900,8 @@ def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
     finally:
         mlx_utils.release_mlx_training_patches()
     assert mx.gather_qmm._unsloth_gather_qmm_guard
-    import inspect   # the only production install site
+    import inspect  # the only production install site
+
     assert "apply_gather_qmm_nax_guard()" in inspect.getsource(FastMLXModel.from_pretrained)
 
 
@@ -2809,10 +2945,11 @@ def test_the_logit_sum_holds_the_widest_vocabulary_in_float16(dtype):
 @pytest.mark.parametrize("targets,attention", [(["lm_head"], True),
                                                (["q_proj", "lm_head"], False)])
 def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
-    from test_mlx_lora_group_selection import HIDDEN, VOCAB, _adapters, _peft
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
     from mlx_lm.models.bitnet import Model, ModelArgs
+    from test_mlx_lora_group_selection import HIDDEN, VOCAB, _adapters, _peft
+
     model = Model(ModelArgs(
         model_type="bitnet", hidden_size=HIDDEN, intermediate_size=HIDDEN * 2,
         num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
@@ -2890,6 +3027,7 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     """
     import subprocess
     import sys
+
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
@@ -2899,7 +3037,10 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     for _ in range(2):
         run = subprocess.run(
             [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
-            capture_output=True, text=True, timeout=900,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
         )
         assert run.returncode == 0, run.stderr[-4000:]
         for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
@@ -2939,6 +3080,7 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
 @metal_only
 def test_checkpointing_keeps_cacheless_kv_shared_gradients():
     from types import SimpleNamespace
+
     from mlx_vlm.models.gemma3n.config import TextConfig
     from mlx_vlm.models.gemma3n.language import Gemma3Model, Gemma3nDecoderLayer
     from unsloth_zoo.mlx.loader import _fix_gemma4_kv_sharing
@@ -3093,9 +3235,13 @@ def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, re
     ce = mlx_utils.make_vlm_baseline_loss_fn(model, ignore_token_ids=[])
     for rows in ([[2, 3, 4, 5], [6, 7, 8, 9]], [[9, 8, 7, 6], [5, 4, 3, 2]]):
         ids = mx.array(rows)
-        batch = dict(input_ids=ids, labels=mx.where(ids % 3 == 0, -100, ids),
-                     attention_mask=mx.ones_like(ids), canvas_ids=ids[:, ::-1],
-                     decoder_attention_mask=mx.ones((2, 8), dtype=mx.bool_))
+        batch = {
+            "input_ids": ids,
+            "labels": mx.where(ids % 3 == 0, -100, ids),
+            "attention_mask": mx.ones_like(ids),
+            "canvas_ids": ids[:, ::-1],
+            "decoder_attention_mask": mx.ones((2, 8), dtype=mx.bool_),
+        }
         batch[conditioning] = mx.random.normal((2, 4, 64)) * 0.1
         (expected, n1), g1 = nn.value_and_grad(model, ce)(model, batch)
         (actual, n2), g2 = nn.value_and_grad(model, cce)(model, batch)
@@ -3254,8 +3400,11 @@ def test_self_routed_vlm_merges_images_inside_loss(use_cce):
     factory = mlx_utils.make_vlm_cce_loss_fn if use_cce else mlx_utils.make_vlm_baseline_loss_fn
     loss = factory(model)
     for pixels in ([[1., 2., 3.], [3., -2., 1.]], [[-1., 0., 2.], [2., 1., -3.]]):
-        batch = dict(input_ids=mx.array([[1, 2, 3], [4, 5, 6]]),
-                     pixel_values=mx.array(pixels), image_scale=mx.array(0.7))
+        batch = {
+            "input_ids": mx.array([[1, 2, 3], [4, 5, 6]]),
+            "pixel_values": mx.array(pixels),
+            "image_scale": mx.array(0.7),
+        }
         def reference(m, b):
             embeds = m.get_input_embeddings(b["input_ids"], b["pixel_values"], image_scale=b["image_scale"])
             logits = m(b["input_ids"], inputs_embeds=embeds.inputs_embeds)

@@ -18,9 +18,9 @@
 
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
-from collections import OrderedDict
 import math
-from typing import Callable
+from collections import OrderedDict
+from collections.abc import Callable
 
 import mlx.core as mx
 
@@ -58,8 +58,8 @@ def _get_memory_budget() -> int:
         if recommended > 0:
             hw_budget = int(recommended * 0.001)
             return max(4 * 1024 * 1024, min(hw_budget, 128 * 1024 * 1024))
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 - device probes may fail across backend versions.
+        return 128 * 1024 * 1024
     return 128 * 1024 * 1024
 
 
@@ -120,7 +120,7 @@ def _recomputes_logits(n_tokens: int, vocab_size: int, bytes_per_element: int) -
     if _RECOMPUTE_LOGITS_BYTES is None:
         try:
             recommended = mx.device_info().get("max_recommended_working_set_size", 0)
-        except Exception:
+        except Exception:  # noqa: BLE001 - device probes use a fallback budget.
             recommended = 0
         _RECOMPUTE_LOGITS_BYTES = recommended // 10 if recommended > 0 else 100 * 128 * 1024 * 1024
     return n_tokens * vocab_size * bytes_per_element > _RECOMPUTE_LOGITS_BYTES
@@ -142,7 +142,7 @@ def _normalize_label_smoothing(value) -> float:
     import numbers
 
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 - preserve the public validation exception.
             f"label_smoothing must be a real number in [0, 1], got {value!r}"
         )
     try:
@@ -151,7 +151,7 @@ def _normalize_label_smoothing(value) -> float:
         raise ValueError(
             f"label_smoothing must be a real number in [0, 1], got {value!r}"
         )
-    if not (eps == eps and 0.0 <= eps <= 1.0):
+    if not (math.isfinite(eps) and 0.0 <= eps <= 1.0):
         raise ValueError(
             f"label_smoothing must be a finite value in [0, 1], got {value!r}"
         )
@@ -1053,7 +1053,7 @@ def _forward_with_hidden_gradient(
     # A start no target can reach leaves only the softmax term of the derivative.
     unreachable_start = mx.array([-(1 << 30)], dtype=mx.int32)
     unit_cotangent = mx.ones((n,), dtype=mx.float32)
-    quantization = dict(group_size=group_size, bits=bits, mode=mode)
+    quantization = {"group_size": group_size, "bits": bits, "mode": mode}
 
     running_max = mx.full((n,), -mx.inf, dtype=mx.float32)
     running_sum_exp = mx.zeros((n,), dtype=mx.float32)
@@ -1121,6 +1121,60 @@ def _forward_with_hidden_gradient(
     # Held until the backward, so store it at the precision the hidden gradient gets.
     gradient = mx.where(valid[:, None], weighted_rows - target_rows, 0.0).astype(hidden.dtype)
     return _poison_invalid_targets(loss, invalid), _poison_invalid_targets(gradient, invalid[:, None])
+
+
+def _frozen_bf16_hidden_gradient(
+    hidden,
+    weight,
+    scales,
+    biases,
+    targets,
+    grad_output,
+    *,
+    group_size,
+    bits,
+    mode,
+    ignore_index,
+):
+    from mlx import nn
+
+    if hidden.shape[0] == 0 or grad_output is None:
+        return mx.zeros_like(hidden)
+    valid, invalid = _target_validity_masks(targets, weight.shape[0], ignore_index)
+    safe_targets = mx.where(valid, targets, 0).astype(mx.int32)
+    grad_output = mx.where(valid, grad_output, 0.0)
+    gradients = []
+    # Smaller GEMMs change BF16 rounding enough to amplify early adapter gradients.
+    block_size = 128
+    for start in range(0, hidden.shape[0], block_size):
+        stop = min(start + block_size, hidden.shape[0])
+        rows = hidden[start:stop]
+        if gradients:
+            rows = mx.depends(rows, [gradients[-1]])
+        labels = safe_targets[start:stop]
+        cotangent = grad_output[start:stop]
+        width = stop - start
+        if hidden.shape[0] > block_size and width < block_size:
+            rows = mx.pad(rows, [(0, block_size - width), (0, 0)])
+            labels = mx.pad(labels, [(0, block_size - width)])
+            cotangent = mx.pad(cotangent, [(0, block_size - width)])
+
+        def token_losses(rows, labels=labels):
+            logits = _chunk_matmul(
+                rows,
+                weight,
+                scales=scales,
+                biases=biases,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            return nn.losses.cross_entropy(logits, labels).astype(mx.float32)
+
+        _, gradient = mx.vjp(token_losses, [rows], [cotangent])
+        gradient = gradient[0][:width]
+        gradients.append(_poison_invalid_targets(gradient, invalid[start:stop, None]))
+    return mx.concatenate(gradients)
 
 
 # Requires lse pre-poisoned with NaN for invalid rows: this fallback does not
@@ -1288,10 +1342,22 @@ def make_runtime_cce_loss_fused_finalize(
             "evictions": cache_stats["evictions"],
         }
 
-    if precompute_hidden_gradient and use_metal_kernel and label_smoothing == 0.0 and (quantized or weight_is_frozen):
+    if (
+        precompute_hidden_gradient
+        and use_metal_kernel
+        and label_smoothing == 0.0
+        and (quantized or weight_is_frozen)
+    ):
+
         @mx.custom_function
         def hidden_gradient_loss_full(hidden, weight, scales, biases, targets):
-            return _forward_with_hidden_gradient(
+            native_backward = hidden.dtype == mx.bfloat16 and logit_softcap == 0.0
+            forward = (
+                _forward_chunked_fused_finalize
+                if native_backward
+                else _forward_with_hidden_gradient
+            )
+            losses, auxiliary = forward(
                 hidden,
                 weight,
                 targets,
@@ -1305,22 +1371,41 @@ def make_runtime_cce_loss_fused_finalize(
                 chunk_size=get_chunk_plan(hidden, weight)[0],
                 forward_update_kernel=forward_update_kernel,
                 forward_update_finalize_kernel=forward_update_finalize_kernel,
-                dlogits_kernel=dlogits_kernel,
+                **({} if native_backward else {"dlogits_kernel": dlogits_kernel}),
             )
+            return losses, auxiliary[:, None] if native_backward else auxiliary
 
         @hidden_gradient_loss_full.vjp
         def hidden_gradient_loss_vjp(primals, cotangents, outputs):
             hidden = primals[0]
-            grad_output = cotangents[0] if isinstance(cotangents, (tuple, list)) else cotangents
-            if grad_output is None:
+            grad_output = (
+                cotangents[0] if isinstance(cotangents, (tuple, list)) else cotangents
+            )
+            if hidden.dtype == mx.bfloat16 and logit_softcap == 0.0:
+                grad_hidden = _frozen_bf16_hidden_gradient(
+                    *primals,
+                    grad_output,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    ignore_index=ignore_index,
+                )
+            elif grad_output is None:
                 grad_hidden = mx.zeros_like(hidden)
             else:
-                grad_hidden = (grad_output.astype(mx.float32)[:, None] * outputs[1]).astype(hidden.dtype)
-            return (grad_hidden, *(None if p is None else mx.zeros_like(p) for p in primals[1:]))
+                grad_hidden = (
+                    grad_output.astype(mx.float32)[:, None] * outputs[1]
+                ).astype(hidden.dtype)
+            return (
+                grad_hidden,
+                *(None if p is None else mx.zeros_like(p) for p in primals[1:]),
+            )
 
         def hidden_gradient_loss(hidden, weight, *rest):
             scales, biases, targets = rest if quantized else (None, None, rest[0])
-            losses, gradient = hidden_gradient_loss_full(hidden, weight, scales, biases, targets)
+            losses, gradient = hidden_gradient_loss_full(
+                hidden, weight, scales, biases, targets
+            )
             # Same guard as the loss-only path: keep the VJP's output live under mx.compile.
             return losses + gradient[:, 0] * mx.array(0.0, dtype=mx.float32)
 
@@ -1358,6 +1443,27 @@ def make_runtime_cce_loss_fused_finalize(
         def runtime_cce_loss_vjp(primals, cotangents, outputs):
             hidden, weight, scales, biases, targets = primals
             grad_output = cotangents[0] if isinstance(cotangents, tuple) else cotangents
+
+            if (
+                hidden.dtype == mx.bfloat16
+                and logit_softcap == 0.0
+                and label_smoothing == 0.0
+            ):
+                gradient = _frozen_bf16_hidden_gradient(
+                    *primals,
+                    grad_output,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    ignore_index=ignore_index,
+                )
+                return (
+                    gradient,
+                    mx.zeros_like(weight),
+                    mx.zeros_like(scales),
+                    None if biases is None else mx.zeros_like(biases),
+                    mx.zeros_like(targets),
+                )
 
             hidden_compute = hidden
             weight_compute = weight
@@ -1501,6 +1607,26 @@ def make_runtime_cce_loss_fused_finalize(
         hidden, weight, targets = primals
         grad_output = cotangents[0] if isinstance(cotangents, tuple) else cotangents
 
+        if (
+            weight_is_frozen
+            and hidden.dtype == mx.bfloat16
+            and logit_softcap == 0.0
+            and label_smoothing == 0.0
+        ):
+            gradient = _frozen_bf16_hidden_gradient(
+                hidden,
+                weight,
+                None,
+                None,
+                targets,
+                grad_output,
+                group_size=None,
+                bits=None,
+                mode="affine",
+                ignore_index=ignore_index,
+            )
+            return gradient, mx.zeros_like(weight), mx.zeros_like(targets)
+
         hidden_compute = hidden
         weight_compute = weight
         targets32 = targets.astype(mx.int32)
@@ -1624,7 +1750,9 @@ def make_chunked_cross_entropy_loss(
     trainable head may compute its weight gradient even when wrapped in stop_gradient.
     precompute_hidden_gradient builds a frozen or quantized head's hidden gradient
     in the forward (Metal kernels, no label smoothing), which saves backward memory
-    but doubles the cost of a call that is never differentiated.
+    but doubles the cost of a call that is never differentiated. Uncapped BF16
+    frozen heads instead recompute native CE derivatives in 128-token blocks to
+    preserve native rounding without storing batch-wide logits.
     """
 
     return make_runtime_cce_loss_fused_finalize(
@@ -1642,9 +1770,9 @@ def make_chunked_cross_entropy_loss(
 
 
 def supported_lora_head(head):
-    import mlx.nn as nn
-    from mlx_lm.tuner.lora import LoRALinear
+    from mlx import nn
     from mlx.utils import tree_flatten
+    from mlx_lm.tuner.lora import LoRALinear
 
     if type(head) is not LoRALinear:
         return False
