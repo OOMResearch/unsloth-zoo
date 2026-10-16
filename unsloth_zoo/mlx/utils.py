@@ -16397,13 +16397,26 @@ def _get_src_path(model):
 def _save_mlx_config(config, config_path, *, is_vlm=False):
     """Save MLX config using the backend-aware upstream helper."""
     config = copy.deepcopy(config)
+    quantization = config.get("quantization")
+    if isinstance(quantization, dict):
+        # Selective runtime quantization can produce only per-layer entries.
+        # MLX-LM still indexes global defaults before consulting those entries.
+        # Borrow a complete layer's grid, retaining every per-layer override
+        # (including mixed grids) and any explicit global defaults.
+        for entry in list(quantization.values()):
+            if isinstance(entry, dict) and {"group_size", "bits"} <= entry.keys():
+                for key in ("group_size", "bits", "mode"):
+                    quantization.setdefault(key, entry.get(key, "affine"))
+                break
     if is_vlm:
         if "quantization" in config:
             config["quantization_config"] = config["quantization"]
         from mlx_vlm.utils import save_config as save_vlm_config
+
         save_vlm_config(config, config_path)
     else:
         from mlx_lm.utils import save_config as save_lm_config
+
         save_lm_config(config, config_path)
 
 
