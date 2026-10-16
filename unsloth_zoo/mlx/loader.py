@@ -4498,6 +4498,13 @@ def _get_existing_mlx_quantization(config_data: dict):
         return quantization
     quantization_config = config_data.get("quantization_config", None)
     if quantization_config:
+        # Mistral3 sanitizes HF FP8 weights to BF16 before MLX quantization.
+        if (
+            config_data.get("model_type") == "mistral3"
+            and isinstance(quantization_config, dict)
+            and quantization_config.get("quant_method") == "fp8"
+        ):
+            return None
         return quantization_config
     return None
 
