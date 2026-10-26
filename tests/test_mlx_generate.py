@@ -342,12 +342,12 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     tokenizer, adapter = _CharTokenizer(), object.__new__(_TextBatchAdapter)
     tokenizer.eos_token_ids = ()
     adapter.model, adapter.tokenizer = object(), tokenizer
-    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16)
+    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16, prefill_step_size=8192)
     adapter.batch_generator_type = Generator
     adapter.make_sampler = lambda **_kwargs: None
     result = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert result.token_ids == [1] and Generator.instances[-1].removed == [7]
-    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size")) == (2, 3, 16)
+    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size", "prefill_step_size")) == (2, 3, 16, 8192)
     assert Generator.instances[-1].closed is True
     Generator.eos = True
     eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
@@ -357,6 +357,12 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
         adapter.defaults = GenerationDefaults(stop_token_ids=chosen)
         _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
         assert Generator.instances[-1].kwargs["stop_tokens"] == stops
+        assert "prefill_step_size" not in Generator.instances[-1].kwargs  # the runtime's own step
+    # A runtime whose BatchGenerator takes no step keeps its own.
+    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
+    adapter.batch_generator_type = type("Stepless", (Generator,), {"__init__": lambda self, model, max_tokens, stop_tokens, prefill_batch_size, completion_batch_size, max_kv_size: Generator.__init__(self, max_kv_size=max_kv_size)})  # noqa: E501
+    _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
+    assert Generator.instances[-1].kwargs == {"max_kv_size": None}
     assert GenerationDefaults(256, SamplingParams(), (), 2, 3, 16).max_kv_size == 16
     for bad in ([True], [-1], [1.5]):
         with pytest.raises(ValueError, match="non-negative integer"):
@@ -626,10 +632,10 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
                    types.SimpleNamespace(to_dict=lambda: {"inputs_embeds": "E", "position_ids": None}))
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant")
+    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant", prefill_step_size=8192)
     adapter.per_row_prompt_kwargs = True
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start"}  # noqa: E501
+    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start", "prefill_step_size"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
     adapter._add_special_tokens = lambda: True
@@ -658,6 +664,11 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     # Per-row keeps configured sizes; EOS stays with the processor.
     assert (seen["ctor"]["prefill_batch_size"], seen["ctor"]["completion_batch_size"]) == (8, 32)
     assert "stop_tokens" not in seen["ctor"]
+    assert seen["ctor"]["prefill_step_size"] == 8192
+    # A model that must not chunk its prefill still prefills whole.
+    adapter._chunked_prefill_kwargs = lambda **kw: {"prefill_step_size": None}
+    list(adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1]))
+    assert seen["ctor"]["prefill_step_size"] is None
 
 
 @pytest.mark.parametrize("nested", (True, False))
@@ -1026,7 +1037,10 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
     assert (kwargs["audio"], kwargs["max_tokens"]) == ("a.wav", 9)
     assert kwargs["sampler"] is adapter.sampler
     assert (adapter.sampler_kwargs["temp"], adapter.sampler_kwargs["top_k"]) == (0.25, 7)
-    assert kwargs["logits_processors"] == []
+    assert kwargs["logits_processors"] == [] and "prefill_step_size" not in kwargs
+    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
+    _audio_row(adapter, GenerationRequest(prompt="p", audio="a.wav"))
+    assert adapter.stream_calls.pop()[1]["prefill_step_size"] == 8192
     # Decoding alone is not a reason to drop what the request asked for.
     shown = []
     _result, _ = _audio_row(adapter, GenerationRequest(
@@ -1112,7 +1126,8 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     assert results[1].token_ids == [1]
 
 
-def test_vision_generation_resolves_the_saved_processor(monkeypatch):
+@pytest.mark.parametrize("audio", [None, [0.0, 0.1]])
+def test_vision_generation_resolves_the_saved_processor(monkeypatch, audio):
     # A text-only multimodal load publishes its inner tokenizer, so the typed
     # core resolves the saved processor for both it and fast_generate.
     from unsloth_zoo.mlx.generate import generate_batch as engine_generate_batch
@@ -1123,11 +1138,11 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
         def stream(self, requests):
             return iter([GenerationEvent(index=0, result="ok")])
     monkeypatch.setattr(engine, "_VLMBatchAdapter", _Adapter)
-    monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(engine, "generation_mode", lambda model, call: seen.update(call=call) or contextlib.nullcontext())
     processor = object()
     model = types.SimpleNamespace(_is_vlm_model=True, _processor=processor)
-    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a")]) == ["ok"]
-    assert seen["tok"] is processor
+    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a", audio=audio)]) == ["ok"]
+    assert seen["tok"] is processor and seen["call"] == ("batch", "vision", *(() if audio is None else ("audio",)))
 
 
 def _knob_sampler(**knobs):
@@ -1409,6 +1424,8 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert [session.generator.kwargs[n] for n in ("kv_bits", "kv_group_size")] == [8, 32]
     with contextlib.closing(_vlm_session(kv_bits = 4, kv_quant_scheme = "turboquant", quantized_kv_start = None)) as session:  # noqa: E501
         assert session.generator.kwargs["quantized_kv_start"] == 0  # from the first token, not mlx-vlm's 5000
+    with contextlib.closing(_vlm_session(prefill_step_size = 8192)) as session:
+        assert session.generator.kwargs["prefill_step_size"] == 8192
 
 
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
@@ -1623,6 +1640,17 @@ def test_a_text_row_carries_its_own_logits_processors_into_the_batch(monkeypatch
     assert seen[1 - carrying] == [[]]
     assert [_shows(processor, [4, 5, 6]) for processor in seen[carrying][0]] == [7]
 
+def test_only_an_mlx_lm_image_model_s_text_batch_takes_an_image_row(monkeypatch):
+    image_row = GenerationRequest(prompt = "p", image = "a.png")
+    assert _validate_text_requests([image_row], GenerationDefaults(), True) == [image_row]
+    for images, kwargs in ((False, {"prompt": "p", "image": 1}), (True, {"prompt_token_ids": [1], "image": 1}),
+                           (True, {"prompt": "p", "audio": 1})):
+        with pytest.raises(ValueError, match = "media|token ids"):
+            _validate_text_requests([GenerationRequest(**kwargs)], GenerationDefaults(), images)
+    with contextlib.closing(_open_stream(monkeypatch)) as stream, pytest.raises(ValueError, match = "media"):
+        stream.add(image_row)
+
+
 def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
     with pytest.raises(TypeError, match="must be GenerationDefaults"):
         stream_batch(object(), object(), [], defaults = {"stop_strings": ()})
@@ -1632,7 +1660,7 @@ def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
 
 
 def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_cache():
-    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
+    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1}, {"prefill_step_size": True}, {"prefill_step_size": 0})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
     with contextlib.closing(_vlm_session()) as session:
         session.adapter.row_logits_processors = False
         with pytest.raises(ValueError, match = "cannot carry") as refusal:
@@ -1675,9 +1703,12 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import (exact_speculative_verify, fused_decode_conv_silu, fused_moe_gate_up,
-                                           fused_moe_routed_experts, fused_moe_router, fused_packed_gated_delta,
-                                           fused_residual_norm, fused_residual_norm_handoff, fused_verify_attention)
+    from unsloth_zoo.mlx.inference import (exact_batch_invariant_decode, exact_dilated_depthwise_conv,
+                                           exact_ple_row_reads, exact_qsa_trim, exact_speculative_verify,
+                                           fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
+                                           fused_moe_router, fused_packed_gated_delta, fused_qwen4_decode,
+                                           fused_qwen4_prefill, fused_residual_norm, fused_residual_norm_handoff,
+                                           fused_verify_attention)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1687,30 +1718,124 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
                 fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model), \
-                exact_speculative_verify(model), fused_packed_gated_delta(model), fused_verify_attention(model):
+                exact_speculative_verify(model), exact_batch_invariant_decode(model), fused_packed_gated_delta(model), \
+                fused_verify_attention(model), exact_ple_row_reads(model), exact_qsa_trim(model), \
+                exact_dilated_depthwise_conv(model), fused_qwen4_prefill(model), fused_qwen4_decode(model):
             pass
 
 
-def test_generation_paths_enter_every_inference_fusion(monkeypatch):
-    # A scope missing from generation_mode or a loader generate site silently leaves that path native.
+def test_every_inference_scope_is_registered_and_every_generation_path_enters_the_registry(monkeypatch):
+    # A scope missing from the registry silently leaves every path native.
     import ast
 
     from unsloth_zoo.mlx import generate as generate_module, inference, loader
-    prefixes = ("fused_", "nax_", "dense_", "exact_")
-    scopes = {name for name, value in vars(inference).items()
-              if name.startswith(prefixes) and getattr(value, "__module__", None) == inference.__name__}
+    scopes = {value for name, value in vars(inference).items() if inspect.isfunction(value)
+              and name != "inference_scopes" and "_modules" in inspect.signature(value).parameters}
+    assert scopes == {scope.enter for scope in inference.INFERENCE_SCOPES}
     entered = []
-    for name in scopes:
-        monkeypatch.setattr(inference, name, lambda model, *args, name=name, **kwargs: entered.append(name) or contextlib.nullcontext(model))
-    with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
-        pass
-    assert sorted(entered) == sorted(scopes)
-    sites = [{item.context_expr.func.id for item in node.items
-              if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
-             for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
-    sites = [site for site in sites if any(name.startswith(prefixes) for name in site)]
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [inference.InferenceScope(
+        lambda model, _modules: entered.append((model, _modules)) or contextlib.nullcontext())])
+    model = types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [("", stub)])
+    stub = types.SimpleNamespace(training=False)
+    with generate_module.generation_mode(model):
+        assert entered == [(model, (("", stub),))]
+    calls = [node for node in ast.walk(ast.parse(inspect.getsource(loader)))
+             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "inference_scopes"]
     # The loader's generate sites run no speculative verify rounds.
-    assert len(sites) == 2 and all(site == scopes - {"exact_speculative_verify", "fused_verify_attention"} for site in sites)
+    assert [ast.literal_eval(call.args[1]) for call in calls] == [("vision",), ()]
+
+
+def _recording_scopes(monkeypatch, entered, *scopes):
+    from unsloth_zoo.mlx import inference
+
+    def scope(name, fails = False):
+        @contextlib.contextmanager
+        def enter(model, *args, _modules):
+            assert type(_modules) is tuple   # the one walk every scope shares
+            if fails:
+                raise RuntimeError(name)
+            entered.append((name, args))
+            try:
+                yield model
+            finally:
+                entered.append(("exit " + name, ()))
+        enter.__name__ = name
+        return enter
+
+    monkeypatch.setattr(inference, "INFERENCE_SCOPES", [
+        inference.InferenceScope(scope(name, **options.pop("scope", {})), **options) for name, options in scopes])
+    return inference.inference_scopes
+
+
+@pytest.mark.parametrize("call, opt_in, names", [
+    (None, None, ["every", "drafted", "vision"]),
+    ((), None, ["every"]),
+    (("vision", "speculative"), "1", ["every", "drafted", "vision", "opt_in"]),
+    ("speculative", "0", ["every", "drafted"]),
+    (("a trait this zoo does not know",), "true", ["every"]),
+    ("one-shot iterator", None, ["every", "vision"]),
+])
+def test_inference_scopes_enter_what_the_call_is_served_by_and_opt_in_only_when_switched_on(monkeypatch, call, opt_in, names):
+    entered = []
+    compose = _recording_scopes(monkeypatch, entered, ("every", {}), ("drafted", {"serves": frozenset({"speculative"})}),
+                                ("vision", {"serves": frozenset({"vision", "audio"})}),
+                                ("opt_in", {"opt_in": "UNSLOTH_MLX_TEST_SCOPE"}))
+    if opt_in is None:
+        monkeypatch.delenv("UNSLOTH_MLX_TEST_SCOPE", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MLX_TEST_SCOPE", opt_in)
+    if call == "one-shot iterator":
+        call = iter(("vision", "audio"))
+    model = types.SimpleNamespace()
+    with compose(model, call) as active:
+        assert active is model and [name for name, _ in entered] == names
+    assert [name for name, _ in entered[len(names):]] == ["exit " + name for name in reversed(names)]
+
+
+def test_an_open_text_batch_holds_the_scopes_a_batch_is_served_by(monkeypatch):
+    entered = []
+    _recording_scopes(monkeypatch, entered, ("every", {}), ("batch", {"serves": frozenset({"batch"})}),
+                      ("drafted", {"serves": frozenset({"speculative"})}), ("vision", {"serves": frozenset({"vision"})}))
+    _open_stream(monkeypatch).close()
+    assert [name for name, _ in entered] == ["every", "batch", "exit batch", "exit every"]
+
+
+@pytest.mark.parametrize("vlm, speculative, call", [
+    (False, None, ("batch",)), (True, None, ("batch", "vision")), (True, object(), ("batch", "vision", "speculative"))])
+def test_a_batch_stream_describes_its_call_to_generation_mode(monkeypatch, vlm, speculative, call):
+    from unsloth_zoo.mlx import generate as module
+
+    seen = []
+    session = lambda *args: types.SimpleNamespace(close = lambda: None)
+    monkeypatch.setattr(module, "_stream_setup", lambda *args: (vlm, object()))
+    monkeypatch.setattr(module, "generation_mode", lambda model, call: seen.append(call) or contextlib.nullcontext())
+    for name in ("_generation_cache_hygiene", "_TextBatchSession", "_VLMBatchSession", "_SpeculativeBatchSession"):
+        monkeypatch.setattr(module, name, session if name.endswith("Session") else contextlib.nullcontext)
+    module.BatchStream(object(), object(), speculative = speculative).close()
+    assert seen == [call]
+
+
+def test_inference_scopes_pass_int8_prefill_only_where_registered_and_report_or_raise_refusals(monkeypatch):
+    entered, refused = [], []
+    compose = _recording_scopes(monkeypatch, entered, ("first", {"int8_prefill": True}),
+                                ("refuses", {"scope": {"fails": True}}), ("last", {}))
+    with compose(object(), int8_prefill = False, on_error = lambda name, error: refused.append((name, str(error)))):
+        assert entered == [("first", (False,)), ("last", ())] and refused == [("refuses", "refuses")]
+    entered.clear()
+    with pytest.raises(RuntimeError, match = "refuses"):
+        with compose(object()):
+            pass  # pragma: no cover
+    assert entered == [("first", (None,)), ("exit first", ())]
+
+
+@pytest.mark.parametrize("int8_prefill", [None, True])
+def test_warm_inference_generates_greedily_under_the_int8_decision(int8_prefill):
+    from unsloth_zoo.mlx.inference import warm_inference
+
+    calls = []
+    warm_inference(types.SimpleNamespace(generate = lambda prompt, **kwargs: calls.append((prompt.tolist(), kwargs))),
+                   int8_prefill = int8_prefill)
+    assert calls == [([list(range(1, 65))], {"max_tokens": 2, "do_sample": False, "int8_prefill": int8_prefill})]
 
 
 def test_cache_layout_tells_quantized_packings_apart():

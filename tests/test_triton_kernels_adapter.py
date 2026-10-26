@@ -190,11 +190,18 @@ def _make_fake(name, api):
             meta = types.SimpleNamespace(col_sum = hist, col_sorted_indx = combine, row_sorted_indx = dispatch)
             return types.SimpleNamespace(vals = vals, indx = indx, mask_metadata = meta)
 
+        @dataclasses.dataclass
+        class RaggedTensorMetadata:
+            slice_sizes: torch.Tensor
+            slice_offs: torch.Tensor
+
+        RaggedTensorMetadata.__module__ = ragged.__name__
+
         def make_ragged_tensor_metadata(slice_sizes, n_total_rows):
             assert slice_sizes.dtype == torch.int32
             offs = torch.cat((slice_sizes.new_zeros(1), torch.cumsum(slice_sizes, 0, dtype = torch.int32)))
             assert int(offs[-1]) == n_total_rows
-            return types.SimpleNamespace(slice_sizes = slice_sizes, slice_offs = offs)
+            return RaggedTensorMetadata(slice_sizes, offs)
 
         topk_mod.topk = topk
         ragged.make_ragged_tensor_metadata = make_ragged_tensor_metadata
@@ -254,7 +261,12 @@ def fresh(monkeypatch):
     monkeypatch.delenv("UNSLOTH_TRITON_KERNELS_SOURCE", raising = False)
     monkeypatch.delenv("UNSLOTH_MXFP4_MATMUL_OGS", raising = False)
     monkeypatch.setattr(tkc, "_import_vllm_vendored", lambda: None)
-    return monkeypatch
+    before = set(sys.modules)
+    yield monkeypatch
+    # monkeypatch restores modules it replaced, not ones a test imported fresh: a fake `vllm`
+    # left behind makes a later importorskip("vllm") on this worker return it instead of skipping.
+    for key in [k for k in sys.modules if k not in before and k.split(".", 1)[0] in ("vllm", "triton_kernels")]:
+        del sys.modules[key]
 
 
 ALL_APIS = (tkc.API_OGS_ROUTING, tkc.API_OGS_RAGGED, tkc.API_MATMUL_RAGGED)
@@ -460,7 +472,41 @@ def test_new_generation_translates_indices_and_precision(fresh):
     (_, g, _, _), (_, _, s, pc_down) = pkg.calls
     torch.testing.assert_close(g, gather.src_indx // k)
     torch.testing.assert_close(s, scatter.dst_indx)
-    assert pc_down.out_dtype == torch.float32 and pc.out_dtype is None
+    assert pc_down is pc and pc.out_dtype is None
+
+
+def test_new_generation_down_rows_stay_in_output_dtype(fresh):
+    # fp32 matmul rows would double every down projection's (tokens * k, hidden) buffer.
+    pkg = _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
+    backend = tkc.get_triton_kernels_backend()
+    x, logits, w1, b1, w2, b2 = _moe_inputs()
+    k = 2
+    rd, gather, scatter = backend.routing(logits, k)
+    h = torch.randn(x.shape[0] * k, w2.shape[1]).to(torch.bfloat16)
+    out = backend.down(h, w2, b2, rd, scatter, None, gammas = rd.gate_scal)
+    (_, _, _, pc_down), = pkg.calls
+    assert pc_down is None or pc_down.out_dtype in (None, torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    rows = sys.modules["triton_kernels.matmul"].matmul(
+        h, w2, b2, a_ragged_metadata = rd.expt_data, scatter_indx = scatter.dst_indx, gammas = rd.gate_scal,
+    )
+    assert rows.dtype == torch.bfloat16
+    torch.testing.assert_close(out, rows.view(-1, k, rows.shape[-1]).float().sum(1).to(torch.bfloat16), rtol = 0, atol = 0)
+
+
+def test_dense_training_follows_the_copy_that_built_ragged_routing(fresh):
+    # Routing came from the top-level copy: resolve it from the ragged metadata, not the SOURCE env var.
+    _install(fresh, "triton_kernels", tkc.API_MATMUL_RAGGED)
+    vendored = _install(fresh, "vllm.third_party.triton_kernels", tkc.API_OGS_ROUTING)
+    fresh.setattr(tkc, "_import_vllm_vendored", lambda: tkc._probe(vendored))
+    fresh.setenv("UNSLOTH_TRITON_KERNELS_SOURCE", "vllm")
+    assert tkc.selected_triton_kernels()[0] == "vllm.third_party.triton_kernels"
+    x, logits, *_ = _moe_inputs()
+    routing_data, _, _ = tkc.triton_kernels_backend_for("triton_kernels").routing(logits, 2)
+    assert isinstance(routing_data, tkc.RoutingData)
+    module = torch.nn.Module()  # LoRA / training forward never sets _unsloth_tk_root
+    assert go._ogs_root_for(torch.zeros(1), routing_data, module) == "triton_kernels"
+    assert go._ogs_backend_for(torch.zeros(1), routing_data, module).api == tkc.API_MATMUL_RAGGED
 
 
 def test_unswizzle_handles_both_layout_contracts(fresh):
@@ -549,10 +595,17 @@ def test_real_routing_matches_a_dense_moe_across_experts():
     x = torch.randn(T, K, device = "cuda", generator = g).to(torch.bfloat16)
     logits = torch.randn(T, E, device = "cuda", generator = g)
     rdata, gather, scatter = backend.routing(logits, k)
-    out = backend.matmul_ogs(
-        x, w, None, rdata, gather_indx = gather, scatter_indx = scatter,
-        precision_config = precision, gammas = rdata.gate_scal,
-    ).float()
+    if tkc.native_mxfp4_matmul_ok(x.device, backend):
+        out = backend.matmul_ogs(
+            x, w, None, rdata, gather_indx = gather, scatter_indx = scatter,
+            precision_config = precision, gammas = rdata.gate_scal,
+        ).float()
+    else:
+        # sm_12x + release/3.6.x: the matmul cannot run there, so the experts take the exact bf16 decode instead.
+        from unsloth_zoo.temporary_patches import gpt_oss as go
+        assert tkc.matmul_ogs_available(x.device) is False
+        rows = x[torch.div(gather.src_indx.long(), k, rounding_mode = "floor")]
+        out = go._ogs_dequant_down(rows, rdata.gate_scal, w, None, rdata, scatter, precision).float()
     vals, idx = torch.topk(logits, k, dim = 1)
     ref = torch.einsum("tk,tkn->tn", torch.softmax(vals, dim = 1), torch.einsum("tc,tknc->tkn", x.float(), dense[idx]))
     assert ((out - ref).norm() / ref.norm()).item() < 1e-2
@@ -583,3 +636,92 @@ def test_dense_training_follows_the_copy_the_patched_forward_launches(fresh):
     module.__dict__["_unsloth_tk_root"] = "triton_kernels"
     assert go._ogs_root_for(weight, routing_data, module) == "triton_kernels"
     assert go._ogs_backend_for(weight, routing_data, module).name == "triton_kernels"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA for allocator peaks")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("k", [1, 2, 4, 8])
+def test_new_generation_k_sum_needs_no_fp32_temporary(k, dtype):
+    # The k-sum of the down rows must not materialise a (tokens, hidden) fp32 copy: 3.5's matmul_ogs does not.
+    import types as _types
+    T, H = 2048, 2880
+    gen = torch.Generator(device = "cuda").manual_seed(k)
+    rows = torch.randn(T * k, H, device = "cuda", generator = gen).to(dtype)
+    backend = object.__new__(tkc.TritonKernelsBackend)
+    backend.api = tkc.API_MATMUL_RAGGED
+    backend.mm = _types.SimpleNamespace(matmul = lambda *args, **kwargs: rows)
+    routing_data = _types.SimpleNamespace(n_expts_act = k, expt_data = None)
+    scatter = _types.SimpleNamespace(src_indx = None, dst_indx = None)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    out = backend.matmul_ogs(rows, None, None, routing_data, scatter_indx = scatter)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    assert out.dtype == dtype and out.shape == (T, H)
+    assert peak <= out.numel() * out.element_size() * 1.25, peak
+    want = rows.view(T, k, H).sum(1, dtype = torch.float32).to(dtype)
+    assert torch.equal(out.view(torch.int16), want.view(torch.int16))
+
+
+def test_strided_conversion_to_the_layout_already_held_keeps_the_storage():
+    # release/3.7.x's convert_layout always copies: the packed stacks must stay shared.
+    @dataclasses.dataclass(frozen = True)
+    class StridedLayout:
+        major_dim: int = -1
+
+    calls = []
+
+    def convert_layout(tensor, layout, **opts):
+        calls.append(layout)
+        return types.SimpleNamespace(storage = types.SimpleNamespace(data = tensor.storage.data.clone(), layout = layout))
+
+    tensor_module = types.SimpleNamespace(convert_layout = convert_layout)
+    data = torch.zeros(2, 4, 3).transpose(-2, -1)
+    held = types.SimpleNamespace(storage = types.SimpleNamespace(data = data, layout = StridedLayout(-2)))
+    assert tkc.convert_layout_shared(tensor_module, held, StridedLayout(-2)) is held and not calls
+    other = tkc.convert_layout_shared(tensor_module, held, StridedLayout(-1))
+    assert calls == [StridedLayout(-1)] and other.storage.data.data_ptr() != data.data_ptr()
+    # A class contract (old API) or extra options always go through convert_layout.
+    tkc.convert_layout_shared(tensor_module, held, StridedLayout)
+    tkc.convert_layout_shared(tensor_module, held, StridedLayout(-2), mx_axis = 1)
+    assert len(calls) == 3
+
+
+def test_hopper_value_layout_gets_a_negative_k_axis_on_dataclass_layouts():
+    # 3.7+ HopperMXValueLayout asserts mx_axis in (-1, -2); 3.5 / 3.6 take the positional axis 1 of (E, K, N).
+    seen = []
+
+    @dataclasses.dataclass(frozen = True)
+    class StridedLayout:
+        major_dim: int = -1
+
+    @dataclasses.dataclass(frozen = True)
+    class HopperMXValueLayout:
+        mx_axis: int
+        mma_version: int = 3
+
+        def __post_init__(self):
+            assert self.mx_axis in [-1, -2]
+
+    def make_default_matmul_mxfp4_w_layout(mx_axis):
+        seen.append(mx_axis)
+        return HopperMXValueLayout(mx_axis = mx_axis, mma_version = 3)
+
+    layout = types.SimpleNamespace(
+        StridedLayout = StridedLayout, HopperMXValueLayout = HopperMXValueLayout,
+        make_default_matmul_mxfp4_w_layout = make_default_matmul_mxfp4_w_layout,
+    )
+    value_layout, opts, strided = go._mxfp4_layout_arguments(layout, torch.zeros(1, 4, 2, dtype = torch.uint8))
+    assert seen == [-2] and value_layout == HopperMXValueLayout(-2) and opts == {} and strided == StridedLayout(-2)
+
+    class OldStrided:  # 3.6: classes taking the shape, positional axis
+        pass
+
+    seen.clear()
+    old = types.SimpleNamespace(
+        StridedLayout = OldStrided,
+        make_default_matmul_mxfp4_w_layout = lambda mx_axis: (seen.append(mx_axis), (OldStrided, {}))[1],
+    )
+    go._mxfp4_layout_arguments(old, torch.zeros(1, 4, 2, dtype = torch.uint8))
+    assert seen == [1]

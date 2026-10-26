@@ -118,7 +118,7 @@ def test_minicpmv4_7_text_batch_matches_upstream_and_compiles(monkeypatch):
     upstream = getattr(installed, "__wrapped__", installed)
     monkeypatch.setattr(module.Model, "get_input_embeddings", upstream)
     with monkeypatch.context() as changed:
-        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", "0" * 64)
+        changed.setattr(loader, "_MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256", ("0" * 64,))
         assert loader._minicpmv4_7_text_positions_adapter(module.Model) is upstream
     loader._ensure_minicpmv4_7_text_positions("minicpmv4_7")
     patched = module.Model.get_input_embeddings
@@ -335,6 +335,50 @@ def test_training_attention_visits_only_the_window(monkeypatch, window, T, windo
 def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
     q, k = mx.zeros((1, heads, T, dim)), mx.zeros((1, 1, T, dim))
     assert mlx_utils._windowing_pays(q, k, 512) is pays
+
+
+@metal_only
+def test_training_attention_keeps_the_fused_mask_outside_a_training_context():
+    seen = []
+    sdpa = mlx_utils._wrap_training_sdpa(lambda q, k, v, *, scale, mask=None, **kwargs: seen.append(mask))
+    q = mx.zeros((1, 1, 4, 8))
+    sdpa(q, q, q, scale=1.0, mask="causal")   # e.g. a paused evaluation while another run holds the patch
+    token = mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.set(1)
+    try:
+        sdpa(q, q, q, scale=1.0, mask="causal")
+    finally:
+        mlx_utils._MLX_TRAINING_ACTIVE_DEPTH.reset(token)
+    assert seen[0] == "causal" and isinstance(seen[1], mx.array)
+
+
+@metal_only
+@pytest.mark.parametrize("T, mask, sinks", [
+    (1, None, False), (4, "causal", False), (8, "causal", False), (16, "causal", True), (16, None, True)])
+def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sinks):
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((1, 4, T, 64)) for _ in range(3))
+    sink = mx.random.normal((4,)) if sinks else None
+
+    def reference(q):
+        scores = (q * 0.125) @ k.swapaxes(-1, -2)
+        if mask == "causal":
+            scores = mx.where(mx.arange(T)[None] <= mx.arange(T)[:, None], scores, -mx.inf)
+        if sink is not None:
+            scores = mx.concatenate([mx.broadcast_to(sink[None, :, None, None], (1, 4, T, 1)), scores], axis=-1)
+        probs = mx.softmax(scores, axis=-1)
+        return ((probs[..., 1:] if sink is not None else probs) @ v).sum()
+
+    def fused(q):
+        extra = {} if sink is None else {"sinks": sink}
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask=mask, **extra).sum()
+
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        got = mx.grad(fused)(q)
+        mx.eval(got)
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
 
 
 @metal_only
@@ -934,15 +978,23 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+# Ternary Bonsai 2 packs, from mlx-vlm and (0.32+) mlx-lm.
+_HADAMARD_PACKS = pytest.mark.parametrize("pack_module", [
+    "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35", "mlx_lm.models.prism_hadamard_qwen35",
+], ids=["mlx_vlm", "mlx_lm"])
+
+
 @metal_only
-def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
-    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+@_HADAMARD_PACKS
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack_module):
+    pack = pytest.importorskip(pack_module)
+    rotate = getattr(pack, "hadamard_transform", None) or pack.hadamard_rotate
     from unsloth_zoo.mlx import preference
     mx.random.seed(611)
     model = _cce_text_model(2053, 1024, quantized=True)
     head = pack.HadamardQuantizedLinear(1024, 8192, 512)
     head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
-    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    rotated = rotate(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
     head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
     head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
     model.lm_head = head
@@ -2893,16 +2945,24 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
-    # Two interpreters: a fresh one can still read low on all five repeats (one run
-    # read unshared 160329148 throughout), and low stretches do not cross processes.
+    # Four interpreters, always: a fresh one can still read low on all five repeats (one
+    # run read unshared 160329148 throughout), low stretches do not cross processes, and
+    # two were not enough (run 39234730657 read unshared at most 150494752 across both,
+    # about 18% under exact). Readings only ever err low, so a ceiling over more
+    # interpreters sits closer to the exact value on BOTH sides. The count is fixed rather
+    # than "until the bound holds", which would give an under-read shared peak repeated
+    # chances to hide a real regression.
     readings = {"shared": [], "unshared": []}
-    for _ in range(2):
+    per_run = []
+    for _ in range(4):
         run = subprocess.run(
             [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
             capture_output=True, text=True, timeout=900,
         )
         assert run.returncode == 0, run.stderr[-4000:]
-        for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
+        measured = json.loads(run.stdout.strip().splitlines()[-1])
+        per_run.append(measured)
+        for side, values in measured.items():
             readings[side] += values
 
     def ceiling(side):
@@ -2911,7 +2971,9 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         return max(kept)
 
     shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
-    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
+    assert shared_peak < 1.25 * unshared_peak, (
+        f"shared {shared_peak} >= 1.25 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
+    )
 
     # Checkpointing must not change what the shared model computes.
     seq_len = 512
@@ -2979,6 +3041,13 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_gemma3n_compile_patches_recognise_the_installed_language_call():
+    from mlx_vlm.models.gemma3n.language import Gemma3Model
+    import unsloth_zoo.mlx.compile as mc
+    assert mc._gemma3n_language_contract(Gemma3Model.__call__) == "current"
 
 
 @metal_only

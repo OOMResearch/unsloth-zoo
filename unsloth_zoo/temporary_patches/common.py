@@ -29,6 +29,8 @@ __all__ = [
     "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
+    "CHUNK_ALIGN_ROWS",
+    "chunk_row_bounds",
     "publish_to_modeling_module",
     "RESCOPE_PATCH_FLAG",
     "WRAPPER_INNER_ATTR",
@@ -60,6 +62,14 @@ WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 import inspect
 import torch
 inductor_config_source = inspect.getsource(torch._inductor.config)
+
+def _persistent_tma_matmul_ok():
+    # torch 2.12+ guards every GEMM size when Inductor considers its TMA templates
+    # (pytorch/pytorch#172925), so a compiled torch._scaled_mm recompiles for each new token count.
+    import re
+    found = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 12)
+pass
 
 @functools.lru_cache(1)
 def determine_compile_threads():
@@ -150,7 +160,7 @@ def get_torch_compile_options(
 
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
         "triton.use_block_ptr"      : use_block_ptr,
-        "triton.enable_persistent_tma_matmul" : True,
+        "triton.enable_persistent_tma_matmul" : _persistent_tma_matmul_ok(),
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
@@ -346,6 +356,23 @@ def flatten_for_elementwise_norm(hidden_states):
     """
     shape = hidden_states.shape
     return hidden_states.reshape(-1, shape[-1]), shape
+pass
+
+
+# Opt-in: aligned boundaries reorder the float32 per-chunk sums.
+CHUNK_ALIGN_ROWS = 128 if os.environ.get("UNSLOTH_CE_CHUNK_ALIGN", "0").strip() == "1" else 0
+
+def chunk_row_bounds(n_rows, chunks, align = CHUNK_ALIGN_ROWS):
+    """``align``-multiple row ranges no larger than ``ceil(n_rows / chunks)`` (may add ranges).
+    None means keep torch.chunk."""
+    if align <= 1 or chunks <= 1:
+        return None
+    cap = -(-n_rows // chunks)
+    size = (cap // align) * align
+    # A 1-row tail hits the K=1 head-gradient matmul bug (see test_chunked_log_softmax_one_row_chunk).
+    if size == 0 or 4 * size < 3 * cap or n_rows % size == 1:
+        return None
+    return list(range(0, n_rows, size)) + [n_rows]
 pass
 
 
