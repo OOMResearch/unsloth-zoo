@@ -2936,9 +2936,15 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     182285696 (pinned) or 183564288 (latest) when right, and 116 MB, 151 MB, 2284
     bytes or negative when not, sometimes on every one of five repeats. Every flake
     this test has had was such a low unshared reading (runs 35502075009, 36311394738,
-    36377153200). `mx.synchronize()` and `gc.collect()` do not remove them. No reading
-    was ever above the exact value, so each side is taken as the maximum of its
-    repeats, and a reading below the gradients that repeat produced is not kept.
+    36377153200). `mx.synchronize()` and `gc.collect()` do not remove them. Each side
+    is taken as the maximum of its repeats, and a reading below the gradients that
+    repeat produced is not kept.
+
+    The unshared peak also varies upward: with mlx 0.32.4 on an M5 Max, 60 fresh
+    readings ranged 149-212 MB (median 184), while the shared one held at 231.7 MB.
+    Over every 4-interpreter subset of 12 interpreters, shared / unshared was
+    1.09-1.26 with the fix and 1.67-1.95 without it (shared 321-357 MB), so the bound
+    sits between the two rather than at the top of the passing range.
     """
     import subprocess
     import sys
@@ -2948,8 +2954,8 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     # Four interpreters, always: a fresh one can still read low on all five repeats (one
     # run read unshared 160329148 throughout), low stretches do not cross processes, and
     # two were not enough (run 39234730657 read unshared at most 150494752 across both,
-    # about 18% under exact). Readings only ever err low, so a ceiling over more
-    # interpreters sits closer to the exact value on BOTH sides. The count is fixed rather
+    # about 18% under exact). A ceiling over more interpreters is less likely to keep
+    # only low readings on either side. The count is fixed rather
     # than "until the bound holds", which would give an under-read shared peak repeated
     # chances to hide a real regression.
     readings = {"shared": [], "unshared": []}
@@ -2971,8 +2977,8 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         return max(kept)
 
     shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
-    assert shared_peak < 1.25 * unshared_peak, (
-        f"shared {shared_peak} >= 1.25 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
+    assert shared_peak < 1.45 * unshared_peak, (
+        f"shared {shared_peak} >= 1.45 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
     )
 
     # Checkpointing must not change what the shared model computes.
