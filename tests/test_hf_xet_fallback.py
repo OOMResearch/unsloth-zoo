@@ -18,14 +18,13 @@
 file/snapshot entrypoints, the UNSLOTH_DISABLE_XET knob, and HF_HUB_DISABLE_XET.
 
 CPU-only, no network, no real subprocess (the download seam is monkeypatched).
-The modules under test are loaded via importlib to avoid importing the full
-``unsloth_zoo`` package (torch + GPU init).
+The modules under test come from ``unsloth_zoo_downloads``, which does not
+import the full ``unsloth_zoo`` package (torch + GPU init).
 """
 
 from __future__ import annotations
 
 import errno
-import importlib.util
 import json
 import math
 import pathlib
@@ -42,36 +41,8 @@ import pytest
 import huggingface_hub
 from huggingface_hub import constants as hf_constants
 
-_ZOO_DIR = Path(__file__).resolve().parents[1] / "unsloth_zoo"
-
-
-def _load(name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(name, _ZOO_DIR / filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Package placeholder so intra-package imports in hf_xet_fallback resolve to the files
-# loaded below. Restored afterwards: a leftover would shadow the real unsloth_zoo.
-_saved_modules = {
-    name: sys.modules.get(name)
-    for name in ("unsloth_zoo", "unsloth_zoo.hf_cache_state", "unsloth_zoo.hf_xet_fallback")
-}
-if "unsloth_zoo" not in sys.modules:
-    _pkg = _types.ModuleType("unsloth_zoo")
-    _pkg.__path__ = [str(_ZOO_DIR)]
-    sys.modules["unsloth_zoo"] = _pkg
-
-hcs = _load("unsloth_zoo.hf_cache_state", "hf_cache_state.py")
-xf = _load("unsloth_zoo.hf_xet_fallback", "hf_xet_fallback.py")
-
-for _name, _mod in _saved_modules.items():
-    if _mod is None:
-        sys.modules.pop(_name, None)
-    else:
-        sys.modules[_name] = _mod
+from unsloth_zoo_downloads import hf_cache_state as hcs
+from unsloth_zoo_downloads import hf_xet_fallback as xf
 
 # Real prep impl, captured before the autouse fixture stubs the module attribute.
 _REAL_DEFAULT_PREPARE = xf._default_prepare_for_http
@@ -85,6 +56,19 @@ REPO = "ztest/xet-watchdog"
 def hf_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path))
     return tmp_path
+
+
+def _supervised_child(monkeypatch, *partials: str) -> int:
+    """A child that exists and writes exactly *partials*, whatever else is running on the host.
+
+    These tests pass a pid only to reach the data branch. A made-up pid (4242) left the outcome to
+    the runner: when some process of ours happened to hold it, psutil read it as a live child owning
+    no partial, the watchdog took the test's fresh partial for a peer's download and held the clock,
+    and three "must trip" tests failed together on a CI runner. Own the partials explicitly and use
+    a pid that is certainly alive, so the watchdog asks the question each test means to ask.
+    """
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set(partials))
+    return os.getpid()
 
 
 def _blobs_dir(root: Path, repo_id: str = REPO) -> Path:
@@ -4901,7 +4885,7 @@ def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "buffering.incomplete"),
     )
     try:
         time.sleep(1.2)  # 4x the stall deadline
@@ -4921,7 +4905,7 @@ def test_a_child_that_stops_receiving_still_trips(hf_cache, monkeypatch):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "hung.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a hung child never tripped"
@@ -4941,7 +4925,7 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "hung.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "unreadable RSS must not disarm the stall"
@@ -5089,7 +5073,7 @@ def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monke
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         time.sleep(0.15)
@@ -5124,7 +5108,7 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.6, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "slow.incomplete"),
     )
     try:
         time.sleep(1.0)
@@ -5249,7 +5233,7 @@ def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch)
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         for _ in range(30):                      # ~1.5s, nearly 4x the short deadline
@@ -5274,7 +5258,7 @@ def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch)
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a frozen child was given the patient deadline"
