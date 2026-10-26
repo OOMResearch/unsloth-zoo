@@ -58,7 +58,7 @@ from .utils import raise_error, patch_function
 
 
 class _Gemma4KVSharedSafeProxy:
-    """Read-only proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0.
+    """Proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0; writes reach the real config.
 
     Makes `hasattr(proxy, "num_kv_shared_layers")` False so upstream's
     `layer_types[:-0]` slice is skipped; all other lookups forward to the real
@@ -88,6 +88,16 @@ class _Gemma4KVSharedSafeProxy:
                 "the cache constructor to avoid layer_types[:-0] == [] bug"
             )
         return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        # TRL and vLLM write through get_text_config().
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._real, name, value)
+
+    def __delattr__(self, name):
+        delattr(self._real, name)
 
     def get_text_config(self, decoder=None, encoder=None):
         # Return self so recursive get_text_config calls don't unwrap the proxy.
@@ -990,7 +1000,14 @@ def patch_Gemma4TextMLP():
     # Largest value representable in both fp16 and bf16 (65536 rounds to fp16 inf).
     _SAFE_FP16 = 65280.0
 
+    from .gemma import _linear_boundary_dtype, _to_boundary_dtype
+    mod._linear_boundary_dtype = _linear_boundary_dtype
+    mod._to_boundary_dtype = _to_boundary_dtype
+
     def forward(self, x):
+        # Forced float32 full finetuning: x leaves the RMSNorm as fp16, the Linears are fp32 and
+        # nothing autocasts, so meet the weight. Identity whenever they already agree.
+        x = _to_boundary_dtype(x, _linear_boundary_dtype(self, "gate_proj"))
         gate = self.gate_proj(x)
         # Check matmul output dtype to catch autocast / PEFT fp16 casts.
         if gate.dtype != torch.float16:

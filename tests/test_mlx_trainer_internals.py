@@ -2469,8 +2469,9 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
 
     def fake_hf(trainer, *, instruction_part=None, response_part=None,
                 force_match=True, tokenizer=None, return_function=False,
-                num_proc=None, last_response_only=False):
+                num_proc=None, last_response_only=False, mask_out_tokens=None):
         received["last_response_only"] = last_response_only
+        received["mask_out_tokens"] = mask_out_tokens
         return lambda batch: batch
 
     monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
@@ -2482,9 +2483,11 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
         tokenizer=tokenizer,
         return_function=True,
         last_response_only=True,
+        mask_out_tokens=["</think>"],
     )
 
     assert received["last_response_only"] is True
+    assert received["mask_out_tokens"] == ["</think>"]
 
 
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
@@ -2972,7 +2975,7 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
+    forward_source = inspect.getsource(mlx_utils._vlm_hidden_states)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
     # The marker is set by the position-recording prepare phase.
     prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)
@@ -2990,6 +2993,73 @@ def test_mlx_train_result_reports_base_quantization():
     assert '"base_quantization_config"' in source
     assert '"base_quantization_policy"' in source
     assert '"base_quantized_source"' in source
+
+
+def test_native_awq_adapter_base_reloads_as_native_prequant():
+    from unsloth_zoo.mlx import loader as _loader
+
+    native_awq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "awq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+
+    gptq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "gptq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "runtime",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        gptq_cfg,
+        adapter_requires_runtime_quant=True,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    repacked_gptq_cfg = {
+        "base_quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128},
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        repacked_gptq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    assert _loader._adapter_base_prefers_native_prequant(
+        {"base_quantization_config": {"load_in_4bit": True}},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 64, "mode": "affine"},
+        adapter_base_is_bnb=True,
+    ) is False
+    assert _loader._adapter_base_prefers_native_prequant(
+        {},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is False
+
+
+def test_native_awq_adapter_reload_wires_preserve_flag_into_base_load():
+    import inspect
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    source = inspect.getsource(FastMLXModel.from_pretrained)
+    assert "_adapter_base_prefers_native_prequant(" in source
+    assert "\"load_in_4bit\": _reload_base_load_in_4bit," in source
 
 
 def test_mlx_loader_exposes_dense_nf4_diagnostic_mode():
@@ -8537,7 +8607,7 @@ def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
     )
     gkd = {
         "teacher_model_name_or_path", "gkd_beta", "gkd_temperature", "gkd_lmbda",
-        "gkd_chunk_size", "gkd_skip_memory_preflight",
+        "gkd_chunk_size", "gkd_skip_memory_preflight", "group_by_length",
     }
     assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) - gkd == {
         "lr_scheduler_min_lr_rate",

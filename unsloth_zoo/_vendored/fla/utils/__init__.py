@@ -13,6 +13,7 @@ from ._compat import (  # noqa: F401
     TRITON_ABOVE_3_5_1,
     TRITON_ABOVE_3_6_0,
     TRITON_ABOVE_3_7_1,
+    TRITON_ABOVE_3_8_0,
     autotune_cache_kwargs,
 )
 from ._config import (  # noqa: F401
@@ -20,6 +21,7 @@ from ._config import (  # noqa: F401
     FLA_CI_ENV,
     FLA_DISABLE_TENSOR_CACHE,
     FLA_TENSOR_CACHE_SIZE,
+    LONG_INDEXING_THRESHOLD,
 )
 from ._decorators import (  # noqa: F401
     Action,

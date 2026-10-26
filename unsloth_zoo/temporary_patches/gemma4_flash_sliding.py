@@ -38,7 +38,7 @@ import functools
 import torch
 from .common import TEMPORARY_PATCHES, logger
 from .utils import raise_error
-from .gemma4_banded_attention import _banded_sdpa_core, _mask_is_plain_band
+from .gemma4_banded_attention import _banded_sdpa_core, _mask_is_plain_band, _packed_documents
 
 __all__ = ["patch_gemma4_flash_sliding"]
 
@@ -89,6 +89,11 @@ def _force_banded():
 
 def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
                               dropout=0.0, scaling=None, is_causal=None, **kwargs):
+    # Forced float32 full finetuning gives Gemma4VisionAttention fp32 q / k (RoPE follows the
+    # fp32 residual) but fp16 v from v_norm. Promote only then; that case raised before.
+    if not (query.dtype == key.dtype == value.dtype):
+        qkv_dtype = torch.promote_types(torch.promote_types(query.dtype, key.dtype), value.dtype)
+        query, key, value = query.to(qkv_dtype), key.to(qkv_dtype), value.to(qkv_dtype)
     # Shared layer + band gate for both fast kernels (no _HAS_FA2 / dtype clause
     # here, so the banded fallback is reachable without flash-attn).
     if (_enabled()
@@ -103,9 +108,16 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
         # stay bidirectional instead of being forced causal.
         causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
         # No `Sq > w` gate: at seq_len == window transformers still passes a band mask (slow SDPA kernel).
+        packed_seq_lengths = kwargs.get("packed_seq_lengths", None)
+        if (attention_mask is None and _packed_documents(packed_seq_lengths)
+                and not torch.compiler.is_compiling()):
+            logger.warning_once(
+                "Unsloth: a packed gemma-4 row reached attention without a document mask "
+                "(no position_ids?), so its documents attend each other."
+            )
         if (w and Sq == Sk
                 and (attention_mask is not None or causal)
-                and _mask_is_plain_band(attention_mask, Sq, w)):
+                and _mask_is_plain_band(attention_mask, Sq, w, packed_seq_lengths=packed_seq_lengths)):
             covers_all = Sq <= w
             # Prefer FlashAttention-2's window kernel when importable and the dtype
             # is supported; otherwise fall to the pure-SDPA banded kernel so the
