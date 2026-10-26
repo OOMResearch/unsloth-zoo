@@ -1489,6 +1489,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "gkd_chunk_size",
     "gkd_skip_memory_preflight",
     "group_by_length",
+    "gradient_checkpointing_ratio",
 )
 
 
@@ -1564,7 +1565,6 @@ class MLXTrainingConfig:
     compile_auto_tune: bool = True
     compile_trace: bool = True
     gradient_checkpointing: bool = True
-    gradient_checkpointing_ratio: float = 1.0  # Fraction of language layers checkpointed, in (0, 1]; lower trades memory for speed
     streaming: bool = False  # Lazily consume unsized text/VLM sources
     dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
     preserve_dataset_order: bool = False  # Match Unsloth CUDA SequentialSampler order
@@ -1643,6 +1643,9 @@ class MLXTrainingConfig:
     gkd_skip_memory_preflight: bool = False
     # HF TrainingArguments.group_by_length; appended LAST (positional binding).
     group_by_length: bool = False
+    # Fraction of language layers checkpointed, in (0, 1]; lower trades memory
+    # for speed. Appended LAST (positional binding).
+    gradient_checkpointing_ratio: float = 1.0
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
