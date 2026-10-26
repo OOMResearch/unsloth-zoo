@@ -2777,24 +2777,29 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
 
 @metal_only
 def test_cce_loss_precomputes_the_hidden_gradient_only_in_training(monkeypatch):
-    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx import utils as mlx_utils
     from unsloth_zoo.mlx.utils import make_cce_loss_fn
 
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
     ids = mx.array([tokenizer.encode("the capital of France is Paris")])
     lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
-    calls, forward = [], runtime_cce._forward_with_hidden_gradient
-    monkeypatch.setattr(
-        runtime_cce, "_forward_with_hidden_gradient",
-        lambda *args, **kwargs: (calls.append(model.training), forward(*args, **kwargs))[1],
-    )
+    # Pin the variant each mode selects, not the forward inside it: an uncapped
+    # bf16 head's precompute variant builds its gradient in the backward instead.
+    calls, get_runtime_cce = [], mlx_utils._get_runtime_cce
+
+    def recording_runtime_cce(**kwargs):
+        loss = get_runtime_cce(**kwargs)
+        precompute = kwargs.get("precompute_hidden_gradient", False)
+        return lambda *args, **kw: (calls.append((model.training, precompute)), loss(*args, **kw))[1]
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", recording_runtime_cce)
     loss_fn = make_cce_loss_fn(model)
     losses = []
     for training in (True, False):
         model.train(training)
         losses.append(loss_fn(model, ids, lengths)[0])
     mx.eval(losses)
-    assert calls == [True]
+    assert calls == [(True, True), (False, False)]
     assert mx.array_equal(*losses).item()
 
 
