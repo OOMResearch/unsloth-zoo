@@ -47,6 +47,7 @@ import os
 import re
 import warnings
 from collections import OrderedDict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +56,8 @@ ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
-_MAX_PENDING = 64
+# Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
+_MAX_PENDING = 1024
 
 
 def routing_replay_requested():
@@ -130,6 +132,9 @@ def routing_replay_engine_args(config):
         )
         return {}
     args = {"enable_return_routed_experts": True}
+    if _vllm_at_least(0, 21) and not _vllm_at_least(0, 22) and "async_scheduling" in _engine_arg_names():
+        # vLLM 0.21 refuses routed experts capture with (default-on) async scheduling.
+        args["async_scheduling"] = False
     # Fused FlashInfer MoE kernels (auto on Blackwell) pick experts internally and leave the
     # capture all zeros (vllm-project/vllm#44116); the Triton backend goes through the hook.
     if "moe_backend" in _engine_arg_names():
@@ -151,6 +156,7 @@ class _ReplayState:
         self.record = None
         self.pending = []
         self.recomputed = False
+        self.layer_inputs = {}
         self.stats = dict(
             recorded = 0,
             forwards = 0,
@@ -162,6 +168,7 @@ class _ReplayState:
         )
         self.changed = None
         self.warned_invalid = False
+        self.warned_evicted = False
 
 
 _STATE = _ReplayState()
@@ -184,24 +191,88 @@ def _make_key(token_ids, pad_token_id):
     return tuple(t for t in token_ids if t != pad_token_id)
 
 
-def record_routed_experts(request_outputs, pad_token_id = None):
-    """Store vLLM's per-token expert ids for each finished completion."""
+def _agreed(a, b):
+    """Rows of two captures of the same tokens: where their expert sets differ, -1 (natural)."""
+    if a.shape != b.shape:
+        return a
+    same = (a.sort(dim = -1).values == b.sort(dim = -1).values).all(dim = -1, keepdim = True)
+    return torch.where(same, a, torch.full_like(a, -1))
+
+
+def _count_conflicts(a, b):
+    if a.shape != b.shape:
+        return
+    merged = _agreed(a, b)
+    natural = lambda x: (x < 0).all(dim = -1)
+    conflicts = int((natural(merged) & ~natural(a) & ~natural(b)).sum())
+    if conflicts:
+        _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
+
+
+def _fill_prefix(rows, full, start, store):
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
+    prefix = tuple(full[:start])
+    stores = [store]
+    if not _STATE.forwarded_since_record and _STATE.generations:
+        # Earlier rollouts ran on older weights: their routes are not this policy's.
+        stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
+    merged = rows[:start].clone()
+    seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
+    conflict = seen.clone()
+    for candidate in stores:
+        for key, earlier in candidate.items():
+            m = min(start, len(key))
+            if m == 0 or earlier.shape[1:] != rows.shape[1:] or key[:m] != prefix[:m]:
+                continue
+            part = earlier[:m]
+            routed = ~(part < 0).all(dim = -1)
+            same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
+            conflict[:m] |= routed & seen[:m] & ~same
+            new = routed & ~seen[:m]
+            if bool(new.any()):
+                merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                seen[:m] |= new
+    keep = seen & ~conflict
+    rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
+
+
+def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
+    """Store vLLM's per-token expert ids per finished completion. prompt_starts: per-request
+    `SamplingParams.routed_experts_prompt_start` (prompt position of the first returned row)."""
     if pad_token_id is None:
         pad_token_id = _STATE.pad_token_id
     store = {}
     unpadded = {}
-    for request_output in request_outputs:
+    for index, request_output in enumerate(request_outputs):
         prompt_ids = list(getattr(request_output, "prompt_token_ids", None) or [])
+        start = int(prompt_starts[index] or 0) if prompt_starts is not None else 0
+        # vLLM 0.21 returns prompt routes on the request, generated-token routes on the completion.
+        split = hasattr(request_output, "prompt_routed_experts")
+        prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+        if prompt_routed is not None:
+            prompt_routed = torch.as_tensor(prompt_routed).to(torch.int16)
         for completion in getattr(request_output, "outputs", None) or []:
             routed = getattr(completion, "routed_experts", None)
+            if routed is None and split and prompt_routed is not None:
+                # vLLM 0.21 returns None for an empty generation part; the prompt part stays on the request.
+                routed = prompt_routed[:0]
             if routed is None:
                 continue
             full = prompt_ids + list(completion.token_ids)
             routed = torch.as_tensor(routed).to(torch.int16)
             # vLLM never forwards the last sampled token, so it has no routing.
             rows = torch.full((len(full),) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
-            n = min(len(full), routed.shape[0])
-            rows[:n] = routed[:n]
+            if split:
+                parts = [(len(prompt_ids), routed)]
+                if prompt_routed is not None and prompt_routed.shape[1:] == routed.shape[1:]:
+                    parts.append((0, prompt_routed[: len(prompt_ids)]))
+            else:
+                parts = [(start, routed)]
+            for offset, part in parts:
+                n = max(0, min(len(full) - offset, part.shape[0]))
+                rows[offset : offset + n] = part[:n]
+            if start > 0 and not split:
+                _fill_prefix(rows, full, start, store)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
@@ -217,6 +288,9 @@ def record_routed_experts(request_outputs, pad_token_id = None):
                         )
             # Keyed by every token: a pad id inside the sequence (pad == eos) can be real.
             key = tuple(full)
+            if key in store:
+                _count_conflicts(store[key], rows)
+                rows = _agreed(store[key], rows)
             store[key] = rows
             if pad_token_id is not None:
                 unpadded[_make_key(full, pad_token_id)] = key
@@ -228,6 +302,13 @@ def record_routed_experts(request_outputs, pad_token_id = None):
             _STATE.generations[_STATE.generation_id] = []
             _STATE.forwarded_since_record = False
         calls = next(reversed(_STATE.generations.values()))
+        for key, rows in store.items():
+            earlier = None
+            for previous, _, _ in calls:
+                if key in previous:
+                    earlier = previous[key] if earlier is None else _agreed(earlier, previous[key])
+            if earlier is not None:
+                _count_conflicts(earlier, rows)
         calls.append((store, unpadded, pad_token_id))
         # generate without training forwards in between (evaluation) would otherwise grow forever.
         del calls[:-_MAX_CALLS_PER_ROLLOUT]
@@ -239,6 +320,7 @@ def record_routed_experts(request_outputs, pad_token_id = None):
 def _lookup(key, exact = False):
     """Rows for `key`: all attended tokens when `exact`, else the tokens with pad ids dropped."""
     for rollout in reversed(_STATE.generations.values()):
+        found = None
         for store, unpadded, pad in reversed(rollout):
             if exact or pad is None:
                 rows = store.get(key, None)
@@ -248,8 +330,24 @@ def _lookup(key, exact = False):
                 if full is not None:
                     rows = store[full][torch.tensor([t != pad for t in full], dtype = torch.bool)]
             if rows is not None:
-                return rows
+                found = rows if found is None else _agreed(found, rows)
+        if found is not None:
+            return found
     return None
+
+
+def _prompt_starts(args, kwargs, count):
+    params = kwargs.get("sampling_params", args[1] if len(args) > 1 else None)
+    # Same per-prompt test as vLLM's offline _params_to_seq; a SamplingParams is no Sequence.
+    if isinstance(params, Sequence):
+        starts = [getattr(p, "routed_experts_prompt_start", 0) or 0 for p in params]
+        if len(starts) != count:
+            if any(starts):
+                raise ValueError("cannot align routed_experts_prompt_start with the outputs")
+            return None
+        return starts if any(starts) else None
+    start = getattr(params, "routed_experts_prompt_start", 0) or 0
+    return [start] * count if start else None
 
 
 def wrap_vllm_generate(llm):
@@ -262,7 +360,8 @@ def wrap_vllm_generate(llm):
     def generate_with_routing_record(*args, **kwargs):
         outputs = generate(*args, **kwargs)
         try:
-            record_routed_experts(outputs if isinstance(outputs, (list, tuple)) else [outputs])
+            outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+            record_routed_experts(outputs_list, prompt_starts = _prompt_starts(args, kwargs, len(outputs_list)))
         except Exception as error:
             warnings.warn(f"Unsloth: routing replay could not record routed experts: {error}")
         return outputs
@@ -316,18 +415,30 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
             out = torch.full((rows * T,) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
         out[torch.tensor(cols) + row * T] = routed
         replayed += len(cols)
-    _STATE.stats["replayed_tokens"] += replayed
-    _STATE.stats["unmatched_tokens"] += unmatched
+    _count("replayed_tokens", replayed)
+    _count("unmatched_tokens", unmatched)
     if out is None:
         return None
     return out.to(input_ids.device, non_blocking = True).long()
 
 
-def _decoder_pre_hook(module, args, kwargs):
+_MEDIA_KWARGS = ("pixel_values", "pixel_values_videos", "input_features")
+
+
+def _input_ids(args, kwargs):
     input_ids = kwargs.get("input_ids", None)
     if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]) and not args[0].is_floating_point():
         input_ids = args[0]
-    _STATE.stats["forwards"] += 1
+    return input_ids
+
+
+def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
+    input_ids = _input_ids(args, kwargs)
+    if input_ids is None and parent_input_ids:
+        parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
+        if torch.is_tensor(parent_ids) and torch.is_tensor(embeds) and embeds.shape[:2] == parent_ids.shape:
+            input_ids = parent_ids
+    _count("forwards")
     _STATE.forwarded_since_record = True
     _STATE.in_forward = True
     _STATE.record = None
@@ -337,7 +448,15 @@ def _decoder_pre_hook(module, args, kwargs):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
-        del _STATE.pending[:-_MAX_PENDING]
+        if len(_STATE.pending) > _MAX_PENDING:
+            del _STATE.pending[:-_MAX_PENDING]
+            if not _STATE.warned_evicted:
+                _STATE.warned_evicted = True
+                warnings.warn(
+                    f"Unsloth: routing replay kept {_MAX_PENDING} checkpointed forwards without a backward; "
+                    "the oldest ones recompute with the trainer's own routing, so their gradients no longer "
+                    "match their forward. Run backward more often (fewer chunks per backward)."
+                )
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         return None
@@ -367,39 +486,127 @@ def _fingerprint(ids):
     return ids.sort(-1).values.to(torch.int16)
 
 
-def _recomputed_routes(layer_index, ids2):
+_NATURAL = object()
+
+
+_SIGNATURE_PROJECTIONS = {}
+_SIGNATURE_CHUNK = 4096
+
+
+def _signature_projection(width, device):
+    key = (width, str(device))
+    projection = _SIGNATURE_PROJECTIONS.get(key)
+    if projection is None:
+        generator = torch.Generator().manual_seed(0x5EED)
+        projection = torch.randn(width, 2, generator = generator, dtype = torch.float32).to(device)
+        _SIGNATURE_PROJECTIONS[key] = projection
+    return projection
+
+
+def _input_signature(args, tokens):
+    # Per token fp32 random projections of the router input. The recompute feeds the router the
+    # same bits as the forward did, so this tells apart forwards whose natural routes are equal.
+    # Random directions, not a plain sum: zero-centred (LayerNorm) inputs all sum to about zero.
+    x = args[0] if args and torch.is_tensor(args[0]) else None
+    if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
+        return None
+    # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
+    with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
+        x = x.detach().reshape(tokens, -1)
+        projection = _signature_projection(x.shape[-1], x.device)
+        # Chunked so the fp32 upcast stays bounded for long sequences.
+        return torch.cat([
+            x[a : a + _SIGNATURE_CHUNK].float() @ projection
+            for a in range(0, tokens, _SIGNATURE_CHUNK)
+        ])
+
+
+def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
     # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
     # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
     if not _STATE.pending:
         return None
     _STATE.recomputed = True
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
+    if layer_input:
+        # Checkpoint recompute reuses the forward's input tensors (offloaded checkpointing only
+        # rebuilds hidden states), so the forward sharing the most addresses is the one recomputed.
+        shared = [len(c[4] & layer_input) if len(c) > 4 and isinstance(c[4], frozenset) else 0 for c in candidates]
+        best = max(shared, default = 0)
+        if best > 0 and shared.count(best) == 1:
+            candidates = [candidates[shared.index(best)]]
     if not candidates:
-        return ids2.long(), torch.zeros((ids2.shape[0], 1), dtype = torch.bool, device = ids2.device)
+        # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
+        # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
+        return _NATURAL
     fp = _fingerprint(ids2)
-    match = torch.stack([(c[0] == fp).all() for c in candidates])
-    pick = match.to(torch.int32).argmax()
+    match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
+    if signature is not None:
+        # Narrow the natural matches to the forwards whose router input was the same too. Only a
+        # refinement: when no input matches exactly, the natural matches stand as before.
+        has = [len(c) > 3 and c[3] is not None and c[3].shape == signature.shape for c in candidates]
+        if all(has):
+            same = (torch.stack([c[3] for c in candidates]) == signature).flatten(1).all(-1)
+        else:
+            same = torch.stack([
+                (c[3] == signature).all() if h else torch.zeros((), dtype = torch.bool, device = match.device)
+                for c, h in zip(candidates, has)
+            ])
+        exact = match & same.to(match.device)
+        match = torch.where(exact.any(), exact, match)
+    # index_select, not forced_all[pick]: a 0-dim CUDA index is read back to the host.
+    pick = match.to(torch.int32).argmax().reshape(1)
     forced_all = torch.stack([c[1] for c in candidates])
-    forced = forced_all[pick]
+    forced = forced_all.index_select(0, pick)[0]
     # Several forwards with the same natural routing but different replays cannot be told
     # apart, so keep the natural routing there rather than guess. Only the expert set counts:
     # the same experts in another order route and weight every token identically.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
-    valid = torch.stack([c[2] for c in candidates])[pick] & match.any() & agree
+    valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
     return forced, valid
 
 
 def _softmax_gather(logits, ids, renorm):
-    w = F.softmax(logits.float(), dim = -1).gather(-1, ids)
-    return w / w.sum(dim = -1, keepdim = True) if renorm else w
+    if renorm:
+        # Equal to softmax over all experts gathered then renormalised, but without the 0 / 0 NaN
+        # when every forced expert underflows (forced logits far below the natural top-k).
+        return F.softmax(logits.float().gather(-1, ids), dim = -1)
+    return F.softmax(logits.float(), dim = -1).gather(-1, ids)
+
+
+# Below this the forced experts' probability mass is gone: 1 / total would reach 1e20 in the
+# backward, and the router could not have picked them anyway.
+_MIN_RENORM_TOTAL = 1e-20
+
+
+def _probs_gather(probs, ids, renorm):
+    w = probs.float().gather(-1, ids)
+    if not renorm:
+        return w
+    # Forced experts whose probabilities (nearly) all underflowed have no weights to renormalise:
+    # w / total there is 0 / 0, and a subnormal total still overflows the backward (~1 / total).
+    # Those rows return zeros (the router hook then keeps the natural routing); dividing by 1
+    # there keeps the masked-out branch's gradient finite.
+    total = w.sum(dim = -1, keepdim = True)
+    ok = total > _MIN_RENORM_TOTAL
+    out = w / torch.where(ok, total, torch.ones_like(total))
+    return torch.where(ok, out, torch.zeros_like(out))
 
 
 def _formulas():
     # softmax_renorm also covers gpt-oss style softmax over the top-k logits: they are equal.
+    # probs_*: transformers 5.2 - 5.7 Qwen MoE routers return softmax probabilities as "logits".
     return OrderedDict(
         softmax_renorm = lambda logits, ids: _softmax_gather(logits, ids, True),
         softmax = lambda logits, ids: _softmax_gather(logits, ids, False),
+        probs_renorm = lambda probs, ids: _probs_gather(probs, ids, True),
+        probs = lambda probs, ids: _probs_gather(probs, ids, False),
     )
+
+
+def _looks_like_probs(logits2):
+    with torch.no_grad():
+        return bool(((logits2 >= 0).all() & ((logits2.float().sum(-1) - 1).abs() < 1e-3).all()).item())
 
 
 def _split_router_output(output):
@@ -424,9 +631,22 @@ def _split_router_output(output):
     return None
 
 
-def _router_hook(layer_index):
+def _count(name, amount = 1):
+    # Python counters read inside a compiled region become Dynamo guards whose value changes every
+    # call, recompiling the router (or a compiled decoder) each step. They are diagnostics only,
+    # so skip them there.
+    if not torch.compiler.is_compiling():
+        _STATE.stats[name] += amount
+
+
+def _router_hook(layer_index, compact = None):
+    # compact: (position among the MoE layers, number of MoE layers) when some decoder layers are
+    # dense. vLLM 0.21 numbers routed experts by MoE layer only, so its rows skip dense layers.
     def hook(module, args, output):
         replay = _STATE.current
+        row = layer_index
+        if compact is not None and replay is not None and replay.dim() == 3 and replay.shape[1] == compact[1]:
+            row = compact[0]
         positions = _split_router_output(output)
         if positions is None:
             if not getattr(module, "_unsloth_replay_warned", False):
@@ -436,7 +656,7 @@ def _router_hook(layer_index):
                     f"{type(module).__name__} (it routes inside the MoE block); this layer keeps "
                     f"its natural routing."
                 )
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
         li, wi, ii, dense = positions
         logits, weights, ids = output[li], output[wi], output[ii]
@@ -448,24 +668,41 @@ def _router_hook(layer_index):
             weights2 = scores2.gather(-1, ids2.long())
         else:
             weights2 = weights.reshape(ids2.shape)
-        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2)
+        signature = None
+        if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
+            signature = _input_signature(args, ids2.shape[0])
+        recomputed = None if _STATE.in_forward else _recomputed_routes(
+            layer_index, ids2, signature, _STATE.layer_inputs.get(layer_index),
+        )
         if recomputed is not None:
-            _STATE.stats["router_calls_recomputed"] += 1
+            _count("router_calls_recomputed")
+        if recomputed is _NATURAL:
+            _count("router_calls_natural")
+            return None
         if recomputed is None and replay is None:
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
         if recomputed is None and (
             replay.shape[0] != ids2.shape[0]
-            or layer_index >= replay.shape[1]
+            or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         ):
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
 
         formula = getattr(module, "_unsloth_replay_formula", None)
         if formula is None:
             # Pick the weight formula that reproduces this router's own natural weights.
+            # Probabilities must never be softmaxed again: near ties would pass the check below.
+            probs = _looks_like_probs(logits2)
+            # A router that states whether it renormalises the top-k decides it: top-k mass near
+            # one would otherwise pass a normalised formula for an unnormalised router.
+            renorm = getattr(module, "norm_topk_prob", None)
             for name, fn in _formulas().items():
+                if name.startswith("probs") != probs:
+                    continue
+                if isinstance(renorm, bool) and name.endswith("_renorm") != renorm:
+                    continue
                 with torch.no_grad():
                     candidate = fn(logits2, ids2).to(weights2.dtype).float()
                 if torch.allclose(candidate, weights2.float(), rtol = 2e-2, atol = 2e-3):
@@ -479,26 +716,35 @@ def _router_hook(layer_index):
                 )
             module._unsloth_replay_formula = formula
         if formula is False:
-            _STATE.stats["router_calls_natural"] += 1
+            _count("router_calls_natural")
             return None
 
         if recomputed is None:
-            forced = replay[:, layer_index, :]
+            # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
+            forced = replay[:, row, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
-                _STATE.record[layer_index] = (_fingerprint(ids2), forced.clone(), valid)
+                _STATE.record[layer_index] = (
+                    _fingerprint(ids2), forced.clone(), valid, signature, _STATE.layer_inputs.get(layer_index),
+                )
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
         reweight = _formulas()[formula]
-        new_weights = reweight(logits2, forced).to(weights2.dtype)
+        new_weights = reweight(logits2, forced)
+        if formula == "probs_renorm":
+            # The forced probabilities (nearly) all underflowed: nothing to replay with, so keep the
+            # natural routing (_probs_gather returns zeros there).
+            valid = valid & (new_weights.sum(dim = -1, keepdim = True) > 0)
+            forced = torch.where(valid, forced, ids2.long())
+        new_weights = new_weights.to(weights2.dtype)
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
-            _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed
-        _STATE.stats["router_calls_replayed"] += 1
+            _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed.to(_STATE.changed.device)
+        _count("router_calls_replayed")
 
         if dense:
             new_weights = torch.zeros_like(scores2).scatter(-1, forced, new_weights)
@@ -512,9 +758,26 @@ def _router_hook(layer_index):
     return hook
 
 
+def _tensor_addresses(values):
+    out = set()
+    for value in values:
+        for x in (value if isinstance(value, (tuple, list)) else (value,)):
+            if torch.is_tensor(x) and x.numel() > 0:
+                out.add(x.data_ptr())
+    return out
+
+
+def _layer_pre_hook(layer_index):
+    def hook(module, args, kwargs):
+        # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
+        _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(list(args) + list(kwargs.values()))) or None
+        return None
+
+    return hook
+
+
 def _is_router(module):
     name = type(module).__name__
-    # Also Unsloth's GptOssTopKRouterBnb4bit.
     return "TopKRouter" in name or "TopkRouter" in name
 
 
@@ -540,15 +803,41 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         elif decoder is None and isinstance(getattr(module, "layers", None), torch.nn.ModuleList) \
                 and hasattr(module, "embed_tokens"):
             decoder = module
+            decoder_name = name
     if not routers or decoder is None:
         warnings.warn(
             "Unsloth: routing replay found no transformers >= 5 TopKRouter modules on this "
             "model (older transformers route inside the MoE block); routing replay is off."
         )
         return 0
+    moe_layers = sorted({layer_index for layer_index, _ in routers})
+    dense = len(moe_layers) < len(decoder.layers)
     for layer_index, module in routers:
-        module.register_forward_hook(_router_hook(layer_index))
-    decoder.register_forward_pre_hook(_decoder_pre_hook, with_kwargs = True)
+        compact = (moe_layers.index(layer_index), len(moe_layers)) if dense else None
+        module.register_forward_hook(_router_hook(layer_index, compact))
+    for layer_index in moe_layers:
+        if layer_index < len(decoder.layers):
+            decoder.layers[layer_index].register_forward_pre_hook(_layer_pre_hook(layer_index), with_kwargs = True)
+    parent_input_ids = []
+    if decoder_name:
+        # Qwen3.5 embeds tokens in the parent. Keep its IDs only until that forward exits.
+        parent = model.get_submodule(decoder_name.rpartition(".")[0])
+
+        def parent_pre_hook(module, args, kwargs):
+            # Routes are keyed by token ids alone, so two images behind the same tokens would swap
+            # routes: media forwards keep their natural routing.
+            media = any(kwargs.get(k) is not None for k in _MEDIA_KWARGS)
+            parent_input_ids.append(None if media else _input_ids(args, kwargs))
+
+        def parent_post_hook(module, args, output):
+            if parent_input_ids:
+                parent_input_ids.pop()
+
+        parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
+        parent.register_forward_hook(parent_post_hook, always_call = True)
+    decoder.register_forward_pre_hook(
+        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids), with_kwargs = True,
+    )
     decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True
     print(f"Unsloth: MoE routing replay is on for {len(routers)} routers.")

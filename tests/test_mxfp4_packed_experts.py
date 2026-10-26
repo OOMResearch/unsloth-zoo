@@ -27,6 +27,11 @@ TRANSFORMERS_5 = Version(importlib_version("transformers")) >= Version("5.0.0")
 def _exact_packed_decode(monkeypatch):
     # These tests pin the exact packed decode; test_mxfp4_ogs_decode.py covers the matmul_ogs one.
     monkeypatch.setenv("UNSLOTH_MXFP4_OGS", "0")
+    # The offload flag is process-wide and any earlier load with a cpu / disk device map sets it
+    # (tests/test_cpu_backend.py loads with device_map = "cpu"); a test that wants it set says so.
+    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [False])
+
+
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 needs_triton = pytest.mark.skipif(not mxd._HAS_TRITON, reason = "needs Triton")
 
@@ -69,6 +74,22 @@ def test_torch_reference_matches_transformers():
     scales.view(-1)[:3] = torch.tensor([0, 127, 254], dtype = torch.uint8)
     assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = True)), _bits(convert(blocks, scales)))
     assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = True)), _bits(_reference(blocks, scales)))
+
+
+@pytest.mark.parametrize("old_torch_path", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_torch_reference_is_exact_on_every_torch(monkeypatch, dtype, old_torch_path):
+    # Every byte under every e8m0 scale against fp64 rounded once (the fused kernel's self-check needs this).
+    if old_torch_path:
+        monkeypatch.setattr(mxd, "_LDEXP_EXACT", False)
+    blocks = torch.arange(256, dtype = torch.uint8).reshape(16, 1, 16).repeat(256, 1, 1)
+    scales = torch.arange(256, dtype = torch.uint8).repeat_interleave(16).reshape(4096, 1)
+    lut = torch.tensor(_FP4, dtype = torch.float64)
+    want = torch.empty(4096, 1, 32, dtype = torch.float64)
+    want[..., 0::2] = lut[(blocks & 0x0F).long()]
+    want[..., 1::2] = lut[(blocks >> 4).long()]
+    want = (want * torch.exp2(scales.double() - 127).unsqueeze(-1)).reshape(4096, 32).to(dtype)
+    assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, dtype = dtype)), _bits(want))
 
 
 
@@ -844,5 +865,6 @@ def test_fused_decode_moe_sums_each_tokens_experts_in_a_fixed_order():
     down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, True) + dn_bias[expert]
     rows = torch.empty(down.shape, dtype = torch.float32, device = "cuda")
     rows[order] = (down * weights[token, expert][:, None]).float()
-    want = rows.view(T, k, H).sum(1).to(down.dtype)
+    # In the activation dtype: the float32 biases promote `down`, not the returned MoE output.
+    want = rows.view(T, k, H).sum(1).to(x.dtype)
     assert torch.equal(got.view(T, H), want)

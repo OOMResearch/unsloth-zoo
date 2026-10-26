@@ -22,6 +22,7 @@ except ImportError:
     # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
     torch = None
 import copy
+import contextlib
 import copyreg
 import functools
 import gc
@@ -175,7 +176,10 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = No
     generation_config.suppress_tokens = suppress or None
     if config is not None:
         _set_or_drop(config, _VOCAB_PAD_IDS_KEY, rows)
-        _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+        # An empty ownership list beside remaining rows is kept: dropping it would read back as
+        # "every row is ours" and release suppression the caller set on those rows.
+        if rows: setattr(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+        else: _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
     pass
 pass
 
@@ -449,6 +453,55 @@ def _get_embedding_modules(model):
 pass
 
 
+def _dtensor_type():
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        try:
+            from torch.distributed._tensor import DTensor
+        except Exception:
+            return None
+    return DTensor
+pass
+
+
+@contextlib.contextmanager
+def _gathered_dtensor_weights(model, weights):
+    """FSDP2 DTensor weights cannot be sliced under inference mode. Swap in full copies (all-gather:
+    every rank must call this), then copy each rank's shard back into the same DTensor."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    owners = []
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is not None and any(param is w for w in weights):
+                owners.append((module, name, param))
+    full = {}
+    with torch.inference_mode(False):
+        for weight in weights:
+            if id(weight) not in full:
+                copy = weight.detach().full_tensor().clone()
+                full[id(weight)] = (weight, torch.nn.Parameter(copy, requires_grad = weight.requires_grad))
+        for module, name, param in owners:
+            module._parameters[name] = full[id(param)][1]
+    try:
+        yield
+    finally:
+        with torch.inference_mode(False), torch.no_grad():
+            for module, name, param in owners:
+                module._parameters[name] = param
+            try:
+                from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+            except ImportError:  # torch 2.4: only the private namespace has it
+                from torch.distributed._tensor._utils import compute_local_shape_and_global_offset
+            for weight, copy in full.values():
+                shape, offset = compute_local_shape_and_global_offset(
+                    copy.shape, weight.device_mesh, weight.placements
+                )
+                index = tuple(slice(o, o + n) for o, n in zip(offset, shape))
+                weight.to_local().copy_(copy.data[index])
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -482,6 +535,11 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         import deepspeed
         with torch.inference_mode(False), \
             deepspeed.zero.GatheredParameters(partitioned, modifier_rank = 0), torch.inference_mode():
+            return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
+    DTensor = _dtensor_type()
+    sharded = [w for w in (embeddings.weight, lm_head.weight) if DTensor is not None and isinstance(w, DTensor)]
+    if sharded:
+        with _gathered_dtensor_weights(model, sharded):
             return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
     embedding_matrix = embeddings.weight
     lm_head_matrix   = lm_head.weight
