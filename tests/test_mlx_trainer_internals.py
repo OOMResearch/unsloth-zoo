@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import tempfile
 import types
@@ -1218,6 +1219,22 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
+@pytest.mark.parametrize(
+    "warmup_steps, total_steps",
+    [(0.1, 100), (0.05, 30), (0.1, 8), ("np.float32", 100)],
+)
+def test_fractional_warmup_steps_is_a_ratio_of_total_steps(warmup_steps, total_steps):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    if warmup_steps == "np.float32":
+        np = pytest.importorskip("numpy")
+        warmup_steps = np.float32(0.1)
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(warmup_steps=warmup_steps)
+    expected = math.ceil(total_steps * warmup_steps)
+    assert trainer._resolve_warmup_steps(total_steps=total_steps) == expected
+
+
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
@@ -1324,6 +1341,34 @@ def test_sgd_weight_decay_is_coupled_not_decoupled():
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+@pytest.mark.parametrize("optim_name", ["adam", "adam_8bit"])
+def test_adam_weight_decay_is_coupled(optim_name):
+    """Adam weight decay is coupled L2 (torch.optim.Adam), never dropped."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def trainable_parameters(self):
+            return {"proj": {"weight": mx.array([[2.0, -4.0]]),
+                             "bias": mx.array([6.0])}}
+
+    wd = 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(optim=optim_name, weight_decay=wd)
+    trainer._build_optimizer(total_steps=4)
+
+    assert trainer._coupled_weight_decay == pytest.approx(wd)
+    assert trainer._manual_weight_decay == pytest.approx(0.0)
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    flat = dict(tree_flatten(trainer._apply_coupled_weight_decay(trainer.model, grad)))
+    # Bias exempt, as in HF param groups.
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([1.0 + wd * 2.0, 1.0 + wd * -4.0])
+    assert flat["proj.bias"].tolist() == pytest.approx([1.0])
+
+
 def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -1428,7 +1473,7 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
         lr = trainer.args.learning_rate
         expected = [lr * (total_steps - step) / total_steps for step in range(total_steps)]
         assert values == pytest.approx(expected)
-    elif warmup > 0:
+    elif warmup > 0 and scheduler != "constant":
         assert values[0] == pytest.approx(0.0)
         assert all(value > 0.0 for value in values[1:])
     else:
@@ -2424,8 +2469,9 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
 
     def fake_hf(trainer, *, instruction_part=None, response_part=None,
                 force_match=True, tokenizer=None, return_function=False,
-                num_proc=None, last_response_only=False):
+                num_proc=None, last_response_only=False, mask_out_tokens=None):
         received["last_response_only"] = last_response_only
+        received["mask_out_tokens"] = mask_out_tokens
         return lambda batch: batch
 
     monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
@@ -2437,9 +2483,11 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
         tokenizer=tokenizer,
         return_function=True,
         last_response_only=True,
+        mask_out_tokens=["</think>"],
     )
 
     assert received["last_response_only"] is True
+    assert received["mask_out_tokens"] == ["</think>"]
 
 
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
@@ -2927,7 +2975,7 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
+    forward_source = inspect.getsource(mlx_utils._vlm_hidden_states)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
     # The marker is set by the position-recording prepare phase.
     prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)
@@ -2945,6 +2993,73 @@ def test_mlx_train_result_reports_base_quantization():
     assert '"base_quantization_config"' in source
     assert '"base_quantization_policy"' in source
     assert '"base_quantized_source"' in source
+
+
+def test_native_awq_adapter_base_reloads_as_native_prequant():
+    from unsloth_zoo.mlx import loader as _loader
+
+    native_awq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "awq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+
+    gptq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "gptq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "runtime",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        gptq_cfg,
+        adapter_requires_runtime_quant=True,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    repacked_gptq_cfg = {
+        "base_quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128},
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        repacked_gptq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    assert _loader._adapter_base_prefers_native_prequant(
+        {"base_quantization_config": {"load_in_4bit": True}},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 64, "mode": "affine"},
+        adapter_base_is_bnb=True,
+    ) is False
+    assert _loader._adapter_base_prefers_native_prequant(
+        {},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is False
+
+
+def test_native_awq_adapter_reload_wires_preserve_flag_into_base_load():
+    import inspect
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    source = inspect.getsource(FastMLXModel.from_pretrained)
+    assert "_adapter_base_prefers_native_prequant(" in source
+    assert "\"load_in_4bit\": _reload_base_load_in_4bit," in source
 
 
 def test_mlx_loader_exposes_dense_nf4_diagnostic_mode():
@@ -8492,7 +8607,7 @@ def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
     )
     gkd = {
         "teacher_model_name_or_path", "gkd_beta", "gkd_temperature", "gkd_lmbda",
-        "gkd_chunk_size", "gkd_skip_memory_preflight",
+        "gkd_chunk_size", "gkd_skip_memory_preflight", "group_by_length",
     }
     assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) - gkd == {
         "lr_scheduler_min_lr_rate",
@@ -8635,6 +8750,28 @@ def test_mlx_schedules_match_transformers_lr_lambdas():
         got = _mlx_lr_curve(total, learning_rate=lr, **config_kwargs)
         expected = [lr * hf_lambda(step, **hf_kwargs) for step in range(total)]
         assert got == pytest.approx(expected, abs=1e-9), config_kwargs
+
+
+def test_constant_schedule_ignores_warmup_like_hf():
+    """HF's get_scheduler("constant") never ramps; constant_with_warmup does."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    lr, total, warmup = 2e-4, 20, 5
+    expected = [lr * optimization._get_constant_lambda(step) for step in range(total)]
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant", warmup_steps=warmup,
+    ) == pytest.approx(expected, abs=1e-9)
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant", warmup_ratio=0.25,
+    ) == pytest.approx(expected, abs=1e-9)
+
+    ramp = optimization._get_constant_schedule_with_warmup_lr_lambda
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant_with_warmup",
+        warmup_steps=warmup,
+    ) == pytest.approx(
+        [lr * ramp(step, num_warmup_steps=warmup) for step in range(total)], abs=1e-9,
+    )
 
 
 def test_wsd_num_cycles_is_the_hf_wave_count_not_the_decay_window():
