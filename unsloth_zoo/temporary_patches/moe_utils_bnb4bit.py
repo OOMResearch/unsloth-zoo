@@ -351,43 +351,56 @@ def _log_moe_bnb4bit_backend_once(experts_module, message: str):
         logger.info(message)
 
 
+def _in_caller_dtype(output, hidden_states):
+    # As with the eager experts' index_add_ into zeros_like(hidden_states).
+    if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype and hidden_states.dtype.is_floating_point:
+        return output.to(hidden_states.dtype)
+    return output
+
+
 def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights):
-    """bnb 4-bit MoE forward: dequantize experts to the input dtype, then
+    """bnb 4-bit MoE forward: dequantize experts to the half compute dtype (W4A16), then
     dispatch to the standard MoE backend (grouped_mm / triton / native).
 
     Mirrors `forward_moe_backend_fp8`. Base weights stay in 4-bit Params4bit
     storage; dequantized copies are temporary.
     """
     from .moe_utils import (
-        select_moe_backend,
+        select_moe_backend_without_sonic,
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
         _gate_up_is_interleaved,
         _moe_recompute_enabled,
+        moe_compute_dtype,
     )
+    from .moe_routed import routed_moe_forward
 
-    target_dtype = hidden_states.dtype
-    if not target_dtype.is_floating_point:
-        target_dtype = torch.bfloat16
+    # Decode-sized no-grad calls: only the routed experts (moe_routed.py).
+    routed = routed_moe_forward(self, hidden_states, top_k_index, top_k_weights)
+    if routed is not None:
+        return routed
+
+    target_dtype = moe_compute_dtype(hidden_states)
 
     # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
-        select_moe_backend() == "grouped_mm"
+        select_moe_backend_without_sonic(hidden_states.device) == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
         and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
-        return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
+        output = forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
+        return _in_caller_dtype(output, hidden_states)
 
     gate_up_weight = _dequantize_bnb4bit_expert_weights(self.gate_up_proj, target_dtype)
     down_weight = _dequantize_bnb4bit_expert_weights(self.down_proj, target_dtype)
     if gate_up_weight is None or down_weight is None:
         return None  # not bnb4bit (mixed state) — fall through to caller
 
-    backend = select_moe_backend()
+    backend = select_moe_backend_without_sonic(hidden_states.device)
     if backend == "grouped_mm":
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-grouped_mm.")
         forward_fn = forward_native_grouped_mm
@@ -398,7 +411,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-native_torch loop.")
         forward_fn = forward_native_moe_loop
 
-    return swap_moe_weights_for_call(
+    output = swap_moe_weights_for_call(
         self,
         gate_up_weight,
         down_weight,
@@ -407,6 +420,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         top_k_index,
         top_k_weights,
     )
+    return _in_caller_dtype(output, hidden_states)
 
 
 # ============================================================================
@@ -417,6 +431,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 _GENERIC_EXPERTS_FORWARD_FILE = ("transformers", "integrations", "moe.py")
 
 # Module global, passed as an argument below: _forward_statically_reads_stash only follows global names the forward calls.
+from . import moe_utils as _moe_utils
 from .moe_utils import get_forward_moe_backend
 
 
@@ -456,12 +471,23 @@ def _experts_layout_is_standard(module: nn.Module) -> bool:
 
 
 def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k_index, top_k_weights):
-    """Traced by Dynamo, the backend recomputes a different graph under checkpointing (CheckpointError)."""
-    return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
+    """Kept out of compiled regions: traced there, the backend recomputed a different graph under
+    gradient checkpointing (CheckpointError). Unsloth's per-layer block compile keeps one graph per
+    layer across the recompute, so inside it (UNSLOTH_DECODE_COMPILE set) the backend is traced,
+    resolved ahead of time: the resolver's cache-file checks are not traceable."""
+    backend = None
+    if torch.compiler.is_compiling():
+        backend = _moe_utils._CACHED_FORWARD_MOE_BACKEND
+    if backend is None:
+        backend = resolve_backend()
+    return backend(self, hidden_states, top_k_index, top_k_weights)
 
 
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-    _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
+    from .utils import torch_compiler_disable_unless_decode
+    _forward_generic_experts_eagerly = torch_compiler_disable_unless_decode(
+        _forward_generic_experts_eagerly, recursive = True
+    )
 
 
 def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
@@ -494,6 +520,7 @@ def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
 
     forward.__wrapped__ = original_forward
     forward.__doc__ = original_forward.__doc__
+    get_forward_moe_backend()  # resolve eagerly so a traced first call needs no file checks
     # Set only on classes routed here, so every patched family computes as before.
     klass._unsloth_own_apply_gate = _experts_have_own_apply_gate(module)
     klass.forward = forward
