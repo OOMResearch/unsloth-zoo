@@ -55,7 +55,9 @@ npu.empty_cache = lambda: calls.append("empty_cache")
 npu.is_bf16_supported = lambda: True
 torch.npu = npu
 dt.npu_is_available.cache_clear()
-dt.DEVICE_TYPE = "npu"
+# Both names, as on a real Ascend host: gradient_checkpointing picks its autocast device from
+# DEVICE_TYPE_TORCH at import, which the import-time probe above left at "cuda".
+dt.DEVICE_TYPE = dt.DEVICE_TYPE_TORCH = "npu"
 dt.device_synchronize(); dt.device_empty_cache()
 print("HELPERS", ",".join(calls), dt.device_is_bf16_supported())
 
@@ -83,7 +85,7 @@ if vu is not None:
     vu._device_empty_cache()
 gc.reset_unsloth_gradient_checkpointing_buffers()
 print("CACHE", calls.count("empty_cache") - before)
-print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS, gc.EXTRA_STREAMS, amp)
+print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS[0], gc.EXTRA_STREAMS[0], amp)
 """
 
 _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
@@ -94,6 +96,8 @@ def answers():
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_ZOO_DISABLE_GPU_INIT"}
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_DISABLE_PINNED_MEMORY"] = "1"  # stub npu has no pinned allocator
+    # The "none" cell is the refusal; the CPU training fallback has its own matrix.
+    env["UNSLOTH_DISABLE_CPU_FALLBACK"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
     out = subprocess.run(
         [sys.executable, "-c", _CHILD, *_CELLS],
@@ -144,7 +148,7 @@ def test_npu_skips_the_cuda_flashinfer_setup(answers):
 
 
 def test_npu_gradient_checkpointing_initializes(answers):
-    assert answers.get("gc") == "1 torch.bfloat16 ('main',) (('stream', 0),) npu", answers["stderr"]
+    assert answers.get("gc") == "1 torch.bfloat16 main ('stream', 0) npu", answers["stderr"]
 
 
 @pytest.mark.parametrize(

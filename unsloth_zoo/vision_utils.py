@@ -78,6 +78,7 @@ import math
 import time
 import warnings
 import os
+import re
 from functools import lru_cache
 from collections.abc import Mapping
 
@@ -984,6 +985,77 @@ def get_video_reader_backend() -> str:
     return video_reader_backend
 
 
+def _ffmpeg_protocol(source: str) -> str:
+    """The protocol ffmpeg's url_find_protocol would pick, lower-cased, or "" for a plain path: a
+    leading `name:` even with no `//` (`tcp:host:port`), `subfile,` only when a colon follows, and
+    a one-letter prefix is a Windows drive."""
+    match = re.match(r"([A-Za-z0-9+.-]+)(:|,)", source)
+    if not match or len(match.group(1)) < 2:
+        return ""
+    name = match.group(1).lower()
+    if match.group(2) == ",":
+        return name if name == "subfile" and ":" in source[match.end():] else ""
+    return name
+
+
+_LOCAL_SHARE_HOSTS = ("", "localhost", "wsl$", "wsl.localhost")
+_WINDOWS = os.name == "nt"
+
+
+def _is_network_share(path: str) -> bool:
+    """UNC paths and file: URLs naming a remote host: Windows would open an SMB connection.
+    Elsewhere `//x` is an ordinary path, and `\\\\wsl$` is the user's own WSL distro."""
+    if not _WINDOWS:
+        return False
+    p = path.replace("\\", "/")
+    if p[:5].lower() == "file:":
+        p = p[5:]
+        if p.startswith("//"):
+            host = p[2:].split("/", 1)[0]
+            if host.lower() not in _LOCAL_SHARE_HOSTS:
+                return True
+            p = p[2 + len(host):]
+    if p.startswith(("//?/", "//./")):
+        rest = p[4:]
+        if rest.upper().startswith("UNC/"):
+            p = "//" + rest[4:]
+        else:
+            # A drive or a volume GUID is local; GLOBALROOT/Device/Mup reaches the redirector.
+            return re.match(r"([A-Za-z]:|Volume\{[0-9A-Fa-f-]+\})(/|$)", rest) is None
+    return p.startswith("//") and p[2:].split("/", 1)[0].lower() not in _LOCAL_SHARE_HOSTS
+
+
+# A real video container never starts like this (nor with whitespace or a BOM, which a padded
+# text document would); a playlist would make ffmpeg open its entries itself (file:// segments
+# included), outside every check here.
+_PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat", b"\xef\xbb\xbf", b" ", b"\t", b"\r", b"\n")
+
+
+def _refuse_playlist(path: str, source: str) -> None:
+    with open(path, "rb") as handle:
+        _refuse_playlist_head(handle.read(64), source)
+
+
+def _refuse_playlist_head(head: bytes, source: str) -> None:
+    if head.startswith(_PLAYLIST_HEADS):
+        raise ValueError(f"Unsloth: Refusing a playlist or document as a video URL: `{source}`")
+
+
+def _data_uri_head(source: str) -> bytes:
+    """The first decoded bytes of a data: URI, enough to tell a playlist from a container."""
+    import base64
+    from urllib.parse import unquote_to_bytes
+
+    header, _, payload = source.partition(",")
+    if header.lower().endswith(";base64"):
+        chunk = re.sub(r"\s", "", payload[:256])
+        try:
+            return base64.b64decode(chunk[: len(chunk) // 4 * 4], validate = False)
+        except ValueError:
+            return b""  # malformed: the decoder rejects it on its own
+    return unquote_to_bytes(payload[:256])
+
+
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
         # Pick the decoder first: if none is installed, a temp file would strand.
@@ -991,10 +1063,29 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
         # The decoders fetch remote URLs themselves and follow redirects with no
         # way to refuse, so download through the guard and decode a local file.
         downloaded = None
-        if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
-            downloaded = fetch_remote_media_to_file(ele["video"])
+        source = ele["video"]
+        scheme = _ffmpeg_protocol(source)
+        if scheme in ("http", "https"):
+            downloaded = fetch_remote_media_to_file(source)
             ele = dict(ele)
             ele["video"] = downloaded
+            try:
+                _refuse_playlist(downloaded, source)
+            except BaseException:
+                try: os.unlink(downloaded)
+                except OSError: pass
+                raise
+        elif scheme == "data":
+            _refuse_playlist_head(_data_uri_head(source), source)
+        elif scheme not in ("", "file"):
+            # rtsp://, tcp://, ftp:// ... would be dialled by ffmpeg with no address checks.
+            raise ValueError(f"Unsloth: Refusing a video URL with an unsupported scheme: `{source}`")
+        elif _is_network_share(resolve_file_uri_to_path(source)) and not _allow_private_url_fetch():
+            # Resolved first: file://C:/x is a drive, file:///%5chost/... decodes to a UNC path.
+            raise ValueError(
+                f"Unsloth: Refusing a video path on a network share: `{source}`. "
+                f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load videos from shares you trust."
+            )
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
@@ -1069,6 +1160,84 @@ def collapse_fps(fps, tol=1e-4):
         return None
     f0 = vals[0]
     return float(f0) if all(math.isclose(v, f0, rel_tol=tol, abs_tol=tol) for v in vals[1:]) else vals
+
+
+def _video_metadata_support():
+    """(processor accepts video_metadata, rate is read from it rather than from fps=)."""
+    try:
+        from transformers.processing_utils import VideosKwargs
+        from transformers.video_utils import VideoMetadata
+    except Exception:
+        return False, False
+    takes = "video_metadata" in getattr(VideosKwargs, "__annotations__", {})
+    return takes, takes and hasattr(VideoMetadata, "sampled_fps")
+
+_PROCESSOR_TAKES_VIDEO_METADATA, _VIDEO_RATE_FROM_METADATA = _video_metadata_support()
+
+
+def _fixed_frame_count(video_processor):
+    """num_frames of a processor that samples exactly that many frames per clip (Gemma 4), else None.
+
+    Only the stock sampler honours num_frames; GLM4V and others override sample_frames and size
+    the clip by duration and fps, keeping num_frames as an unused default.
+    """
+    if not getattr(video_processor, "do_sample_frames", False):
+        return None
+    num_frames = getattr(video_processor, "num_frames", None)
+    if not num_frames:
+        return None
+    try:
+        from transformers.video_processing_utils import BaseVideoProcessor
+    except Exception:
+        return None
+    if getattr(type(video_processor), "sample_frames", None) is not BaseVideoProcessor.sample_frames:
+        return None
+    return int(num_frames)
+
+
+def video_processor_kwargs(processor, videos, fps):
+    """(videos, processor kwargs) carrying each video's sampling rate.
+
+    `videos` is one list of decoded videos per example (frames tensor or list of frames), `fps`
+    the matching flat list of sample rates. transformers 5 ignores `fps=` here and reads the rate
+    from `video_metadata` (else assumes 24 fps), which collapses Qwen2.5-VL temporal positions and
+    makes Qwen3-VL drop most frames; a list `fps=` is rejected outright.
+    Fixed-count samplers (Gemma 4, `num_frames=32`) cannot sample a shorter clip, so every clip
+    is resampled to that count here instead and the processor told not to resample.
+    """
+    flat = [v for per_example in videos for v in per_example]
+    fps = list(fps) if isinstance(fps, (list, tuple)) else ([fps] * len(flat) if fps is not None else [])
+    if not _PROCESSOR_TAKES_VIDEO_METADATA or len(fps) != len(flat):
+        return videos, {"fps": collapse_fps(fps)}
+    cap = _fixed_frame_count(getattr(processor, "video_processor", None))
+    metadata, new_videos, i = [], [], 0
+    for per_example in videos:
+        kept = []
+        for video in per_example:
+            n = int(video.shape[0]) if hasattr(video, "shape") else len(video)
+            indices = list(range(n))
+            if cap and n != cap:
+                # Every clip gets exactly cap frames (short ones repeat frames), as the
+                # processor stacks them into one tensor.
+                indices = torch.linspace(0, n - 1, cap).round().long().tolist()
+                video = video[indices] if hasattr(video, "shape") else [video[j] for j in indices]
+            rate = float(fps[i])
+            i += 1
+            metadata.append({
+                "total_num_frames": n,
+                "fps": rate,
+                "duration": n / rate if rate > 0 else None,
+                "frames_indices": indices,
+            })
+            kept.append(video)
+        new_videos.append(kept)
+    kwargs = {"video_metadata": metadata}
+    if not _VIDEO_RATE_FROM_METADATA:
+        # transformers 4.x Qwen2.5-VL still takes the rate from fps= and ignores the metadata
+        kwargs["fps"] = collapse_fps(fps)
+    if cap:
+        kwargs["do_sample_frames"] = False
+    return new_videos, kwargs
 
 
 def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List[Dict]:
@@ -1389,13 +1558,37 @@ def _flatten_message_content(messages, placeholders):
 pass
 
 
+def _template_drops_audio(processor) -> bool:
+    """Granite Speech templates drop an audio part or print the content list's repr; the model expects
+    the audio token inside a string turn instead."""
+    token = getattr(processor, "audio_token", None)
+    if not isinstance(token, str) or not token or not _audio_sub_processors(processor):
+        return False
+    try:
+        with_audio = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        text_only = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        as_string = processor.apply_chat_template(
+            [{"role": "user", "content": f"{token}\nHello!"}], tokenize = False,
+        )
+    except Exception:
+        return False
+    if not isinstance(with_audio, str) or token not in str(as_string):
+        return False
+    return with_audio == text_only or _renders_content_list_as_repr(with_audio, "Hello!")
+pass
+
+
 def _template_needs_string_content(processor) -> bool:
     """List content raises TypeError but the same turn as a string renders."""
     try:
         processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
         )
-        return False
+        return _template_drops_audio(processor)
     except TypeError:
         pass
     except Exception:
@@ -1603,6 +1796,41 @@ def _probe_assistant_single_content(processor, model = None, modality = "image")
 pass
 
 
+# Audio towers that add a fixed 1500 positions, so features must stay padded to the processor's 30 s.
+_FULL_LENGTH_AUDIO_MODEL_TYPES = frozenset({"audioflamingo3", "musicflamingo"})
+
+
+def _text_only_padding(kwargs):
+    """Move top-level padding (and pad_to_multiple_of) into text_kwargs, so the audio feature extractor keeps its own."""
+    text_kwargs = {"padding": kwargs.pop("padding")}
+    if kwargs.get("pad_to_multiple_of") is not None:
+        text_kwargs["pad_to_multiple_of"] = kwargs.pop("pad_to_multiple_of")
+    kwargs["text_kwargs"] = text_kwargs
+    return kwargs
+
+
+def _generation_prompt_fuses_answer(processor, chat_template_kwargs = None) -> bool:
+    """PaddleOCR-VL: "Assistant: Z" tokenizes as [':', ' Z'], generation as [':', ' '] then 'Z' (unslothai/notebooks#149)."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    user = [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}]
+    kwargs = dict(chat_template_kwargs or {}, tokenize = False)
+    try:
+        with_prompt = processor.apply_chat_template(user, add_generation_prompt = True, **kwargs)
+        without = processor.apply_chat_template(user, add_generation_prompt = False, **kwargs)
+        if not isinstance(with_prompt, str) or not isinstance(without, str) \
+            or not with_prompt.startswith(without):
+            return False
+        prompt = with_prompt[len(without):]
+        if not prompt[-1:].isspace():
+            return False
+        prompt_ids = tokenizer(prompt, add_special_tokens = False)["input_ids"]
+        fused_ids = tokenizer(prompt + "Answer", add_special_tokens = False)["input_ids"]
+        return fused_ids[:len(prompt_ids)] != prompt_ids
+    except Exception:
+        return False
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -1613,6 +1841,7 @@ class UnslothVisionDataCollator:
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
         "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
+        "chat_template_kwargs", "split_generation_prompt", "_full_length_audio",
     )
 
     def __init__(
@@ -1635,12 +1864,19 @@ class UnslothVisionDataCollator:
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
+        chat_template_kwargs = None,
+        mask_out_tokens = None, # e.g. ["</think>"]: see train_on_responses_only
     ):
         has_images = getattr(processor, "image_processor", None) is not None or _processor_takes_images(processor)
         audio_call_kwarg = _audio_call_kwarg(processor)
         if not has_images:
             if not _audio_sub_processors(processor):
-                raise TypeError("Unsloth: UnslothVisionDataCollator requires an image or audio processor!")
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator requires an image or audio processor, but got "
+                    f"{type(processor).__name__}, which is text only. Pass the processor returned by "
+                    "FastVisionModel.from_pretrained, not AutoTokenizer. If you loaded a local folder, it is "
+                    "missing preprocessor_config.json: copy it from the original model repo."
+                )
             if audio_call_kwarg is None:
                 raise TypeError(
                     f"Unsloth: UnslothVisionDataCollator does not support {type(processor).__name__}: "
@@ -1661,6 +1897,10 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self._full_length_audio = (
+            getattr(getattr(model, "config", None), "model_type", None) in _FULL_LENGTH_AUDIO_MODEL_TYPES
+        )
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
@@ -1753,6 +1993,7 @@ class UnslothVisionDataCollator:
                 return_function    = True,
                 num_proc           = num_proc,
                 last_response_only = last_response_only,
+                mask_out_tokens    = mask_out_tokens,
             )
         else:
             self.train_on_responses_only = None
@@ -1765,12 +2006,20 @@ class UnslothVisionDataCollator:
         self.assistant_single_content = _probe_assistant_single_content(
             processor, model, "image" if has_images else "audio",
         )
+        self.split_generation_prompt = _generation_prompt_fuses_answer(processor, self.chat_template_kwargs)
         return
 
     def _get_padding_token_ids_on_device(self, device):
         if self.padding_token_ids.device != device:
             self.padding_token_ids = self.padding_token_ids.to(device)
         return self.padding_token_ids
+
+    def _apply_chat_template(self, messages, example = None, **kwargs):
+        # Per-row chat_template_kwargs override the collator's, as in the text path (dataset_utils).
+        row_kwargs = example.get("chat_template_kwargs") if isinstance(example, dict) else None
+        return self.processor.apply_chat_template(
+            messages, **{**(getattr(self, "chat_template_kwargs", None) or {}), **(row_kwargs or {}), **kwargs},
+        )
 
     def __call__(self, examples):
         batch = self._collate(examples)
@@ -1792,6 +2041,12 @@ class UnslothVisionDataCollator:
         if "prompt" in examples[0] and "completion" in examples[0]:
             return self._collate_prompt_completion(examples)
 
+        # Masker may be attached later by train_on_responses_only(trainer).
+        if getattr(self, "split_generation_prompt", False) and getattr(self, "train_on_responses_only", None):
+            split = self._split_at_generation_prompt(examples)
+            if split is not None:
+                return self._collate_prompt_completion(split)
+
         texts  = []
         images = []
         videos = []
@@ -1810,8 +2065,9 @@ class UnslothVisionDataCollator:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
 
-            message = self.processor.apply_chat_template(
+            message = self._apply_chat_template(
                 messages,
+                example = example,
                 tokenize = False,
                 add_generation_prompt = False,
             )
@@ -1851,14 +2107,15 @@ class UnslothVisionDataCollator:
         if has_images:
             proc_kwargs["images"] = images
         if videos:
+            videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             proc_kwargs["videos"] = videos
-            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
-            for k, v in video_kwargs.items():
-                proc_kwargs[k] = v
-        if audios:
-            proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            proc_kwargs.update(extra)
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
+        if audios:
+            proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            if self._full_length_audio:
+                _text_only_padding(proc_kwargs)
         batch = self._call_processor(proc_kwargs, has_images)
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
@@ -1880,8 +2137,16 @@ class UnslothVisionDataCollator:
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, batch.get("attention_mask"))
         batch["labels"] = labels
         return batch
+
+    def _mask_targets_after_padding(self, labels, attention_mask):
+        """Mask targets predicted from a pad position: unpadded rows lose them at the loss shift,
+        so left padding would make batch size 2 differ from 2 accumulation steps."""
+        if not torch.is_tensor(attention_mask) or attention_mask.dim() != 2 or attention_mask.shape != labels.shape:
+            return
+        labels[:, 1:].masked_fill_(attention_mask[:, :-1].to(labels.device) == 0, self.ignore_index)
 
     def _check_supervised(self, labels, attention_mask = None):
         """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
@@ -1910,6 +2175,21 @@ class UnslothVisionDataCollator:
         if not getattr(self, "_warned_unsupervised", False):
             self._warned_unsupervised = True
             logger.warning(msg)
+
+    def _split_at_generation_prompt(self, examples):
+        """Single-answer chats as prompt / completion rows; None if any row has another shape."""
+        split = []
+        for example in examples:
+            messages = self._select_messages_or_raw(example)
+            if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+                return None
+            roles = [m.get("role") for m in messages]
+            if not roles or roles[-1] != "assistant" or roles.count("assistant") != 1:
+                return None
+            row = dict(example) if isinstance(example, dict) else {}
+            row["prompt"], row["completion"] = messages[:-1], messages[-1:]
+            split.append(row)
+        return split
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:
@@ -2024,9 +2304,9 @@ class UnslothVisionDataCollator:
                         message["content"] = content[0]["text"]
         return messages
 
-    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False):
-        return self.processor.apply_chat_template(
-            prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
+    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False, example=None):
+        return self._apply_chat_template(
+            prompt_messages + (completion_messages or []), example=example, tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
     def _load_column_images(self, images):
@@ -2339,18 +2619,28 @@ class UnslothVisionDataCollator:
 
         return new_attn, new_ids, tuple(new_extras)
 
+    @staticmethod
+    def _left_truncation_index(lengths, L, max_len):
+        # Keep each row's start like TRL; [-max_len:] cut the prompt and its image tokens.
+        starts = L - lengths.clamp(min=max_len)
+        return starts.unsqueeze(1) + torch.arange(max_len, device=lengths.device)
+
     def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len, token_type_ids=None):
         _, L = input_ids.shape
         if L <= max_len:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
-        sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
+        if side == "left":
+            idx = self._left_truncation_index(attention_mask.sum(-1), L, max_len)
+            take = lambda t: torch.gather(t, 1, idx)
+        else:
+            take = lambda t: t[:, :max_len]
 
-        input_ids       = input_ids[:, sl]
-        attention_mask  = attention_mask[:, sl]
-        completion_mask = completion_mask[:, sl]
+        input_ids       = take(input_ids)
+        attention_mask  = take(attention_mask)
+        completion_mask = take(completion_mask)
 
         if token_type_ids is not None:
-            token_type_ids = token_type_ids[:, sl]
+            token_type_ids = take(token_type_ids)
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _raise_if_truncation_cut_media(self, before, after, pad_id):
@@ -2420,7 +2710,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
                 p = self._clean_none_keys(p)
-                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False)
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
             else:
                 p_txt = str(p)
 
@@ -2429,7 +2719,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(c)
                 c = self._clean_none_keys(c)
-                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c)
+                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
                 # some models append common template items so this removes them.
                 # see trl/data_utils.py
                 p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
@@ -2474,12 +2764,13 @@ class UnslothVisionDataCollator:
         if pc_has_images:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
+            videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             prompt_kwargs["videos"] = videos
-            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
-            for k, v in video_kwargs.items():
-                prompt_kwargs[k] = v
+            prompt_kwargs.update(extra)
         if audios:
             prompt_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
+            if self._full_length_audio:
+                _text_only_padding(prompt_kwargs)
 
         proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), pc_has_images)
         # Encode completions (RIGHT pad) text-only
@@ -2545,9 +2836,15 @@ class UnslothVisionDataCollator:
         if cross_mask is not None:
             cross_mask = torch.cat((cross_mask, cross_mask[:, -1:].expand(-1, c_ids.shape[1], *cross_mask.shape[2:])), dim=1)
             _, _, (cross_mask,) = self._flush_to_side(*pre_flush, flush_side, pad_id, (cross_mask,))
-            if cross_mask.shape[1] > input_ids.shape[1]:
-                cross_mask = cross_mask[:, -input_ids.shape[1]:] if flush_side == "left" else cross_mask[:, :input_ids.shape[1]]
-            elif cross_mask.shape[1] < input_ids.shape[1]:
+            max_len = self.max_seq_length
+            if max_len is not None and cross_mask.shape[1] > max_len:
+                # Same rows as _truncate_by_side, or the mask shifts against input_ids.
+                if flush_side == "left":
+                    idx = self._left_truncation_index(pre_flush[0].sum(-1), cross_mask.shape[1], max_len)
+                    cross_mask = cross_mask[torch.arange(cross_mask.shape[0], device = idx.device).unsqueeze(1), idx]
+                else:
+                    cross_mask = cross_mask[:, :max_len]
+            if cross_mask.shape[1] < input_ids.shape[1]:
                 fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
                 cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
 
@@ -2562,6 +2859,7 @@ class UnslothVisionDataCollator:
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         labels[labels < 0] = self.ignore_index
+        self._mask_targets_after_padding(labels, attention_mask)
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 
