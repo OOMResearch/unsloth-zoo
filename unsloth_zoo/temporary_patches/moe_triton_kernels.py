@@ -36,6 +36,19 @@ _DISABLED_REASON = None # set on the first failed launch; everything falls back 
 _K = None               # compiled kernels, built on first use
 
 
+def _probe_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+        import triton.language  # noqa: F401
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+# Probed at import: a compiled frame that read _TRITON as None would recompile once a later eager call cached it.
+_TRITON = _probe_triton()
+
+
 def moe_triton_kernels_available(device = None) -> bool:
     global _TRITON
     if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
@@ -43,12 +56,11 @@ def moe_triton_kernels_available(device = None) -> bool:
     if device is not None and getattr(device, "type", None) != "cuda":
         return False
     if _TRITON is None:
-        try:
-            import triton  # noqa: F401
-            import triton.language  # noqa: F401
-            _TRITON = torch.cuda.is_available()
-        except Exception:
-            _TRITON = False
+        available = _probe_triton()
+        # Writing the global inside a traced autograd.Function is a graph break.
+        if torch.compiler.is_compiling():
+            return available
+        _TRITON = available
     return _TRITON
 
 
@@ -211,8 +223,9 @@ def _launch_device(device):
     return torch.cuda.device(device)
 
 
-def nf4_dequant_triton(packed, quant_state, out_shape = None):
-    """NF4 blocksize-64 dequant in quant_state.dtype; None for any other state so bitsandbytes takes over."""
+def nf4_dequant_triton(packed, quant_state, out_shape = None, out = None):
+    """NF4 blocksize-64 dequant in quant_state.dtype; None for any other state so bitsandbytes takes over.
+    out: a contiguous tensor of that dtype and size to decode into."""
     if not moe_triton_kernels_available(packed.device):
         return None
     if (getattr(quant_state, "quant_type", None) != "nf4" or quant_state.blocksize != 64
@@ -229,6 +242,10 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     if numel != 2 * n_bytes:
         return None
     device = packed.device
+    if out is not None and (
+        out.numel() != numel or out.dtype != quant_state.dtype or out.device != device or not out.is_contiguous()
+    ):
+        return None
     code = quant_state.code
     absmax = quant_state.absmax
     nested = bool(quant_state.nested)
@@ -252,7 +269,7 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     BLOCK = 1024
     try:
         triton, kernel, _, _, _ = _get_kernels()
-        out = torch.empty(numel, dtype = quant_state.dtype, device = device)
+        out = torch.empty(numel, dtype = quant_state.dtype, device = device) if out is None else out.view(-1)
         with _launch_device(device):
             kernel[(triton.cdiv(n_bytes, BLOCK),)](
                 q, out, code, absmax, code2, absmax2, offset, n_bytes,

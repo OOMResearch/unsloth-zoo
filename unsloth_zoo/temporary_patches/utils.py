@@ -2285,6 +2285,47 @@ def torch_compiler_disable_unless_decode(func = None, *, recursive = False):
     return forward
 
 
+# (device type, index) pairs Inductor cannot compile bf16 for; None until the first fullgraph call.
+_NO_NATIVE_BF16 = None
+
+
+def _devices_without_native_bf16():
+    global _NO_NATIVE_BF16
+    if _NO_NATIVE_BF16 is None:
+        found = set()
+        try:
+            if torch.cuda.is_available() and torch.version.hip is None:
+                found = {("cuda", i) for i in range(torch.cuda.device_count())
+                         if torch.cuda.get_device_capability(i) < (8, 0)}
+        except Exception:
+            pass
+        _NO_NATIVE_BF16 = frozenset(found)
+    return _NO_NATIVE_BF16
+
+
+def _bf16_on(devices, args, kwargs):
+    for value in (*args, *kwargs.values()):
+        if (isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16
+                and (value.device.type, value.device.index) in devices):
+            return True
+    return False
+
+
+def _eager_for_bf16_without_native_support(func, compiled):
+    """Run bf16 calls eagerly on sm < 80. Inductor skips bf16 there, and from torch 2.13 a skipped fullgraph call
+    raises "found no compiled frames" instead of running eagerly (GPT OSS MXFP4 on T4: matmul_ogs returns bf16)."""
+    @functools.wraps(compiled)  # keeps the compiled markers, as _eager_during_decode does
+    def wrapper(*args, **kwargs):
+        if not torch.compiler.is_compiling():
+            devices = _NO_NATIVE_BF16 if _NO_NATIVE_BF16 is not None else _devices_without_native_bf16()
+            if devices and _bf16_on(devices, args, kwargs):
+                return func(*args, **kwargs)
+        return compiled(*args, **kwargs)
+    wrapper.__wrapped__ = func
+    wrapper._unsloth_compiled_func = getattr(compiled, "_unsloth_compiled_func", compiled)
+    return wrapper
+
+
 def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """`torch.compile` that survives cache exhaustion under `fullgraph = True`.
 
@@ -2312,11 +2353,14 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """
     def _decorate(func):
         func = unwrap_already_compiled(func)
+        if UNSLOTH_COMPILE_DISABLE:
+            return func
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
         if fullgraph:
             compiled = _fall_back_to_eager_on_recompile_limit(
                 compiled, func, getattr(func, "__qualname__", None) or repr(func),
             )
+            return _eager_for_bf16_without_native_support(func, _eager_during_decode(func, compiled))
         return _eager_during_decode(func, compiled)
     return _decorate
 
@@ -2587,39 +2631,6 @@ def patch_function_past_key_values(
 pass
 
 
-def patch_multiple(
-    patches: List[Tuple[Any, str, Callable]], 
-    force: bool = False, 
-    fail_fast: bool = True,
-    match_level: str = "strict",
-    fullgraph = None,
-    dynamic = True,
-) -> Dict[str, bool]:
-    """Apply multiple patches at once."""
-    results = {}
-
-    for target_obj, attr_name, new_func in patches:
-        key = f"{getattr(target_obj, '__name__', str(target_obj))}.{attr_name}"
-        success = patch_function(
-            target_obj,
-            attr_name,
-            new_func,
-            force = force,
-            match_level = match_level,
-            fullgraph = fullgraph,
-            dynamic = dynamic,
-        )
-        results[key] = success
-
-        if fail_fast and not success:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.error(f"Unsloth: Stopping patch process due to failure on {key}")
-            break
-
-    return results
-pass
-
-
 def restore_original(
     target_obj: Any,
     attr_name: str,
@@ -2646,28 +2657,3 @@ def restore_original(
 pass
 
 
-def list_stored_originals(target_obj: Any) -> List[str]:
-    """List all stored original functions on a target object."""
-    stored = []
-    for attr_name in dir(target_obj):
-        if attr_name.startswith('_original_') and not attr_name.startswith('_original___'):
-            # Name format: _original_{module}_{class}_{method} (method = last part).
-            parts = attr_name.split('_')[2:]
-            if len(parts) >= 2:
-                method_name = parts[-1]
-                stored.append(method_name)
-
-    return sorted(list(set(stored)))
-pass
-
-
-def restore_multiple(target_objs_and_attrs: List[Tuple[Any, str]]) -> Dict[str, bool]:
-    """Restore multiple original functions."""
-    results = {}
-
-    for target_obj, attr_name in target_objs_and_attrs:
-        key = f"{getattr(target_obj, '__name__', str(target_obj))}.{attr_name}"
-        results[key] = restore_original(target_obj, attr_name)
-
-    return results
-pass

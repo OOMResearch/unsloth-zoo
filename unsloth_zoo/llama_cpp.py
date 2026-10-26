@@ -94,6 +94,13 @@ COMMANDS_NOT_FOUND = (
     "not found",
     "No such file or directory",
 )
+# What a shell prints for a missing command. cmake's "OpenMP not found" or "pthreads - not found"
+# on a successful configure must not fail the build.
+SHELL_COMMAND_NOT_FOUND = (
+    "command not found",
+    ": not found",
+    "No such file or directory",
+)
 
 # Each manager's own "no such package" phrase: a bare "not found" also matches normal install output.
 PACKAGE_NOT_FOUND = (
@@ -113,6 +120,8 @@ NEEDS_ROOT = (
     "fatal",
     "Root privileges are required",                       # zypper
     "you cannot perform this operation unless you are root",  # pacman
+    "a password is required",                             # sudo -n with no cached credentials
+    "a terminal is required",                             # sudo with no terminal to prompt on
 )
 
 PACKAGE_MANAGER_NAMES = {
@@ -548,6 +557,15 @@ def _stdin_is_usable() -> bool:
     return True
 
 
+def _sudo_prefix():
+    # No terminal: -n fails at once instead of hanging on a password prompt nobody can answer.
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    return "sudo " if interactive else "sudo -n "
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
@@ -597,7 +615,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
                 '--accept-source-agreements',
             ] + extra_args
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"Unsloth: Failed to install {winget_id} via winget.\n"
@@ -610,17 +628,17 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     # Choose package manager based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
-        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}{pkg_manager} install {package} -y"
     elif system_type == "arch":
-        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}pacman -S --noconfirm {package}"
     elif system_type == "alpine":
-        install_cmd = f"{'sudo ' if sudo else ''}apk add {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}apk add {package}"
     elif system_type == "suse":
-        install_cmd = f"{'sudo ' if sudo else ''}zypper --non-interactive install {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}zypper --non-interactive install {package}"
     elif system_type == "gentoo":
-        install_cmd = f"{'sudo ' if sudo else ''}emerge --ask=n {package}"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}emerge --ask=n {package}"
     else:  # Default to debian/apt-get
-        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+        install_cmd = f"{_sudo_prefix() if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
@@ -747,8 +765,12 @@ def do_we_need_sudo(system_type="debian"):
         pass
     pass
 
+    # Never re-run a refresh that already worked, or as root, under sudo.
+    if not sudo or os.geteuid() == 0:
+        return False
+
     # Update all package lists as well
-    update_cmd_sudo = f"sudo {update_cmd}"
+    update_cmd_sudo = f"{_sudo_prefix()}{update_cmd}"
 
     start_time = time.time()
     with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
@@ -812,6 +834,8 @@ def check_pip():
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
             text = True,
+            encoding = "utf-8",
+            errors = "replace",
         )
         output = probe.stdout or ""
 
@@ -827,10 +851,15 @@ def check_pip():
 pass
 
 
+def _utf8_child_env():
+    # Python children write piped stdio in the ANSI code page on Windows; make them emit the UTF-8 we decode.
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
+    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, env = _utf8_child_env(), text=True, encoding="utf-8", errors="replace") as sp:
         stdout, stderr = sp.communicate()
         stdout = stdout or ""
         stderr = stderr or ""
@@ -846,7 +875,7 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
         # Process output
         for line in all_output.splitlines(keepends=True):
             # Check for command not found
-            if line.rstrip().endswith(COMMANDS_NOT_FOUND):
+            if line.rstrip().endswith(SHELL_COMMAND_NOT_FOUND):
                 raise RuntimeError(f"Command not found: {command}")
 
             # Check for other bad outcomes
@@ -920,9 +949,9 @@ def _find_lib_path(lib_name):
     try:
         result = subprocess.run(
             ['gcc', f'-print-file-name={lib_name}'],
-            capture_output=True, text=True
+            capture_output=True,
         )
-        path = os.path.realpath(result.stdout.strip())
+        path = os.path.realpath(os.fsdecode(result.stdout).strip())
         if os.path.isabs(path) and os.path.exists(path):
             return path
     except Exception as exc:
@@ -980,6 +1009,8 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
                     [location, "--help"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=5
                 )
                 if result.returncode == 0 or "usage" in result.stdout.lower() or "usage" in result.stderr.lower():
@@ -1089,22 +1120,65 @@ def _fetch_release_json_asset(assets, asset_name):
         return None
 
 
+# iGPUs a discrete card shadows; mirrors SHADOWING_INTEGRATED_GFX in unsloth's installer.
+_SHADOWING_INTEGRATED_GFX = frozenset(
+    ("gfx90c", "gfx1013", "gfx1033", "gfx1035", "gfx1036", "gfx1103", "gfx1153")
+)
+
+
 def _detect_gpu_target():
     """Return ("cuda", sm, "cuda12"/"cuda13"/None) or ("rocm", "gfxNNNN")
-    from torch, or None when no GPU target is detectable."""
+    from torch, or None when no GPU target is detectable.
+
+    The bundle serves every visible device, not just device 0. CUDA: sm is the minimum
+    visible SM, and a mixed host appends the sorted visible SMs as a 4th element so
+    _select_gpu_assets only offers bundles covering all of them. ROCm: the current
+    device's arch (a discrete card's when the current one is a shadowing iGPU) when every
+    discrete card shares its bundle family, else None (a source build, which _gpu_cmake_flags targets at every visible arch)."""
     if torch is None:
         return None
     try:
         if not torch.cuda.is_available():
             return None
+        count = max(1, torch.cuda.device_count())
         if getattr(torch.version, "hip", None):
-            gfx = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or ""
-            gfx = gfx.split(":")[0]
-            return ("rocm", gfx) if gfx.startswith("gfx") else None
-        major, minor = torch.cuda.get_device_capability(0)
+            archs = []
+            for i in range(count):
+                try:
+                    props = torch.cuda.get_device_properties(i)
+                except Exception:
+                    props = None  # unreadable: skipped below, the readable cards still decide
+                archs.append((getattr(props, "gcnArchName", "") or "").split(":")[0])
+            try:
+                current = torch.cuda.current_device()
+            except Exception:
+                current = 0
+            gfx = archs[current] if 0 <= current < count else archs[0]
+            discrete = [a for a in archs if a.startswith("gfx") and a not in _SHADOWING_INTEGRATED_GFX]
+            if (gfx in _SHADOWING_INTEGRATED_GFX or not gfx.startswith("gfx")) and discrete:
+                # The installer's #7776 rule; an unreadable current card defers the same way.
+                gfx = discrete[0]
+            elif not gfx.startswith("gfx"):
+                gfx = next((a for a in archs if a.startswith("gfx")), gfx)
+            if not gfx.startswith("gfx"):
+                return None
+            # Windows source builds are CUDA-only (_gpu_cmake_flags), so keep the prebuilt there.
+            if not IS_WINDOWS and any(_rocm_gfx_family(a) != _rocm_gfx_family(gfx) for a in discrete):
+                return None
+            return ("rocm", gfx)
+        caps = []
+        for i in range(count):
+            try:
+                caps.append(torch.cuda.get_device_capability(i))
+            except Exception:
+                continue  # unreadable: the readable cards, current device included, still count
+        caps = caps or [torch.cuda.get_device_capability()]
+        sms = sorted({major * 10 + minor for major, minor in caps})
         cuda_version = getattr(torch.version, "cuda", None)
         line = f"cuda{cuda_version.split('.')[0]}" if cuda_version else None
-        return ("cuda", major * 10 + minor, line)
+        if len(sms) > 1:
+            return ("cuda", sms[0], line, tuple(sms))
+        return ("cuda", sms[0], line)
     except Exception:
         return None
 
@@ -1134,13 +1208,16 @@ def _gpu_cmake_flags(gpu_support):
     # Every visible arch, not just device 0, so a mixed-arch host gets code objects for each card.
     targets = []
     try:
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
-                if gfx.startswith("gfx") and gfx not in targets:
-                    targets.append(gfx)
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     except Exception:
-        pass
+        count = 0
+    for i in range(count):
+        try:  # per device: one unreadable card must not drop the archs after it
+            gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
+        except Exception:
+            continue
+        if gfx.startswith("gfx") and gfx not in targets:
+            targets.append(gfx)
     if targets:
         flags.append(f"-DGPU_TARGETS={';'.join(targets)}")
     print(f"Unsloth: Detected ROCm - building llama.cpp with HIP ({' '.join(flags)})")
@@ -1185,7 +1262,9 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
             and a.get("asset_name") in assets
         ]
 
-    _, sm, preferred_line = target
+    _, sm, preferred_line = target[:3]
+    # Mixed host: every visible SM must be covered, not just the minimum.
+    required = set(target[3]) if len(target) > 3 else {sm}
     if system == "Windows":
         kind = "windows-cuda"
     elif system == "Linux":
@@ -1205,7 +1284,7 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
         portable = None
         for a in (a for a in kind_artifacts if a.get("runtime_line") == line):
             supported = {int(s) for s in a.get("supported_sms", []) if str(s).isdigit()}
-            if sm not in supported:
+            if not required <= supported:
                 continue
             if a.get("coverage_class") == "portable":
                 portable = a
@@ -2337,7 +2416,8 @@ def install_llama_cpp(
 
     print_outputs = []
     missing_packages, system_type = check_build_requirements()
-    sudo = do_we_need_sudo(system_type)
+    # The probe refreshes package lists (maybe elevated): only run it when something is missing.
+    sudo = do_we_need_sudo(system_type) if missing_packages else False
     kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
 
     if not missing_packages:
@@ -2425,7 +2505,7 @@ def install_llama_cpp(
                 print(f"Unsloth: cmake configure with {cmake_generator}")
                 print(f"Unsloth: cmake args: {' '.join(cmake_args)}")
 
-            result = subprocess.run(cmake_args, capture_output=True, text=True)
+            result = subprocess.run(cmake_args, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"cmake configure failed (exit {result.returncode}):\n"
@@ -2440,7 +2520,7 @@ def install_llama_cpp(
 
             if print_output: print("Unsloth: Building llama.cpp (this may take several minutes)...")
 
-            result = subprocess.run(build_cmd, capture_output=True, text=True)
+            result = subprocess.run(build_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"cmake build failed (exit {result.returncode}):\n"
@@ -2521,6 +2601,8 @@ def install_llama_cpp(
                     f"-j{cpu_count} --clean-first --target "\
                     f"{' '.join(llama_cpp_targets)}",
                     cwd = llama_cpp_folder,
+                    # Compiler `... is deprecated` warnings are not failures (unsloth#5832).
+                    ignore_deprecation = True,
                     **kwargs
                 )
                 # Move compiled objects to main folder.
@@ -3557,6 +3639,45 @@ def _patch_num_experts(content, eol_fallback = None):
 pass
 
 
+_CHECKPOINT_HPARAMS_MARKER = b"# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED"
+_MAIN_GUARD_PATTERN = re.compile(rb"^if __name__ == (['\"])__main__\1:", re.MULTILINE)
+# conversion/bailingmoe3.py reads Ling 3.x's own keys, which transformers 5.20's bailing_hybrid to_dict()
+# renames (norm_topk_prob) and rewrites (head_dim 128 -> 64): read config.json, as before 5.20 (#14916).
+_CHECKPOINT_HPARAMS_BLOCK = b"""\
+# UNSLOTH_CHECKPOINT_HPARAMS_APPLIED
+_UNSLOTH_CHECKPOINT_HPARAMS_ARCHS = ("BailingMoeV3ForCausalLM", "BailingMoeV3VLForConditionalGeneration")
+def _unsloth_checkpoint_hparams(load_hparams):
+    def wrapped(dir_model, is_mistral_format = False, *args, **kwargs):
+        if not is_mistral_format:
+            try:
+                import json as _json
+                with open(os.path.join(str(dir_model), "config.json"), "r", encoding = "utf-8") as f:
+                    config = _json.load(f)
+                if set(config.get("architectures") or ()) & set(_UNSLOTH_CHECKPOINT_HPARAMS_ARCHS):
+                    return config
+            except Exception:
+                pass
+        return load_hparams(dir_model, is_mistral_format, *args, **kwargs)
+    return wrapped
+ModelBase.load_hparams = staticmethod(_unsloth_checkpoint_hparams(ModelBase.load_hparams))
+
+"""
+
+
+def _patch_checkpoint_hparams(content, layout = "package"):
+    """Insert _CHECKPOINT_HPARAMS_BLOCK before the entrypoint's `if __name__ == "__main__":`.
+    Returns (new_content, status): 'applied' / 'already-applied' / 'pattern-missing' / 'not-package'."""
+    # A monolith converter has no BailingMoeV3, and older ones name the class `Model` with
+    # `load_hparams(dir_model)`: wrapping `ModelBase` there is a NameError on every conversion.
+    if layout != "package": return content, "not-package"
+    if _CHECKPOINT_HPARAMS_MARKER in content: return content, "already-applied"
+    match = _MAIN_GUARD_PATTERN.search(content)
+    if match is None: return content, "pattern-missing"
+    block = _CHECKPOINT_HPARAMS_BLOCK.replace(b"\n", _dominant_newline(content))
+    return content[:match.start()] + block + content[match.start():], "applied"
+pass
+
+
 def _patched_content_parses(content):
     """True iff the patched converter is still syntactically valid Python.
 
@@ -4559,6 +4680,16 @@ def _download_convert_hf_to_gguf_cached(
             raise
         _patch_stages.append(("Qwen2MoE num_experts alias", patched_content))
 
+        # Patch 4: architectures whose converter reads the checkpoint's own config.json keys.
+        try:
+            patched_content, _hparams_status = _patch_checkpoint_hparams(patched_content, _layout)
+            if _hparams_status == "pattern-missing":
+                logger.warning("Unsloth: checkpoint hparams patch target `if __name__ == '__main__':` not found.")
+        except Exception as e:
+            logger.error(f"Unsloth: Error applying checkpoint hparams patch: {e}", exc_info=True)
+            raise
+        _patch_stages.append(("checkpoint hparams", patched_content))
+
 
         # 4. Write Patched File
         # Package entrypoints stay beside conversion/ so the child resolves
@@ -4728,6 +4859,8 @@ def _convert_to_gguf(command, output_filename, print_output = False, print_outpu
         stdout = subprocess.PIPE,
         stderr = subprocess.STDOUT,
         universal_newlines = True,
+        encoding = "utf-8",
+        errors = "replace",
         shell = True,
     )
     ProgressBar._instances.clear()
@@ -5676,6 +5809,7 @@ def _converter_child_env(gguf_py_dir = None, base_env = None):
     sibling tree ahead of our choice. Idempotent.
     """
     env = dict(os.environ if base_env is None else base_env)
+    env["PYTHONIOENCODING"] = "utf-8"
     if not gguf_py_dir:
         return env
     gguf_py_dir = os.path.abspath(gguf_py_dir)
@@ -7685,7 +7819,7 @@ def check_libcurl_dev():
     if system_type == "debian":
         package_name = "libcurl4-openssl-dev"
         try:
-            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True)
+            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True, encoding = "utf-8", errors = "replace")
             is_installed = result.returncode == 0 and 'ii' in result.stdout
             return is_installed, package_name
         except Exception:
@@ -7694,7 +7828,7 @@ def check_libcurl_dev():
     elif system_type == "rpm":
         package_name = "libcurl-devel"
         try:
-            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True, encoding = "utf-8", errors = "replace")
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
@@ -7703,7 +7837,7 @@ def check_libcurl_dev():
     elif system_type == "arch":
         package_name = "curl"
         try:
-            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True)
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             is_installed = result.returncode == 0
             return is_installed, package_name
         except Exception:
@@ -7712,7 +7846,7 @@ def check_libcurl_dev():
     elif system_type == "alpine":
         package_name = "curl-dev"
         try:
-            result = subprocess.run(['apk', 'info', '-e', package_name], capture_output=True, text=True)
+            result = subprocess.run(['apk', 'info', '-e', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             return result.returncode == 0, package_name
         except Exception:
             return False, package_name
@@ -7720,7 +7854,7 @@ def check_libcurl_dev():
     elif system_type == "suse":
         package_name = "libcurl-devel"
         try:
-            result = subprocess.run(['rpm', '-q', package_name], capture_output=True, text=True)
+            result = subprocess.run(['rpm', '-q', package_name], capture_output=True, text=True, encoding="utf-8", errors="replace")
             return result.returncode == 0, package_name
         except Exception:
             return False, package_name
