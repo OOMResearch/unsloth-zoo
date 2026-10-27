@@ -1,0 +1,50 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    # Nightly at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to sync from upstream"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Only run on the fork, never on unslothai/unsloth-zoo itself
+    if: github.repository == 'OOMResearch/unsloth-zoo'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream into fork
+        env:
+          # GITHUB_TOKEN cannot push changes to .github/workflows/*. Set a
+          # SYNC_TOKEN secret (PAT with `repo` + `workflow` scopes) so syncs
+          # that touch upstream workflow files do not fail.
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ inputs.branch || 'main' }}
+        run: |
+          set -euo pipefail
+          echo "Syncing ${GITHUB_REPOSITORY}@${BRANCH} from upstream"
+          if ! out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+                -f branch="${BRANCH}" 2>&1); then
+            echo "::error::Upstream sync failed: ${out}"
+            echo "If this is a merge conflict, resolve it locally:"
+            echo "  git fetch upstream && git merge upstream/${BRANCH}"
+            exit 1
+          fi
+          echo "${out}"
+          {
+            echo "### Upstream sync"
+            echo '```json'
+            echo "${out}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
