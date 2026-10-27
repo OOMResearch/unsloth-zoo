@@ -31,6 +31,7 @@ __all__ = [
 
 import functools
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -64,6 +65,18 @@ def _wants_attentions(module, kwargs):
     return bool(wanted)
 
 
+def in_unsloth_block():
+    """Inside Unsloth's per-decoder-layer compile region (fullgraph=False), where a graph break is legal."""
+    block = sys.modules.get("unsloth.models._block_compile")
+    flag = getattr(block, "_IN_BLOCK", None)
+    return bool(flag) and flag[0] != 0
+
+
+def _compiled_without_break():
+    """Compiling where the sparse paths cannot leave the graph (any compile but Unsloth's blocks)."""
+    return torch.compiler.is_compiling() and not in_unsloth_block()
+
+
 def _eager_only(name):
     # Built inside an enclosing compiled graph, the BlockMask tables and the flex call miscompile
     # (MiniMax: output 95% off, silently). The patched forwards keep the model's own path there.
@@ -84,7 +97,9 @@ def _q_chunk(per_row = 1):
 @functools.lru_cache(maxsize = None)
 def _device_supported(index):
     if torch.version.hip is not None:
-        return True  # first failure latches the fallback
+        # ROCm runs the flex paths (checked on gfx1151: parity with the model's path); a failing call
+        # latches the fallback per shape.
+        return True
     return torch.cuda.get_device_capability(index) >= (8, 0)
 
 
@@ -309,7 +324,7 @@ def minimax_m3_flex_eligible(module, query, key, attention_mask, kwargs):
         return False
     if key.shape[2] <= indexer.topk_blocks * indexer.block_size or query.shape[2] < 16:
         return False
-    if indexer.block_size % _TILE or _wants_attentions(module, kwargs) or torch.compiler.is_compiling():
+    if indexer.block_size % _TILE or _wants_attentions(module, kwargs) or _compiled_without_break():
         return False
     if module.training and module.attention_dropout:
         return False
@@ -335,7 +350,10 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
     if past_key_values is not None:
         k = past_key_values.update_indexer(k, indexer.layer_idx)
     k_t = k.transpose(-1, -2).float().unsqueeze(1)  # [B, 1, D, T]
-    weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (indexer.n_heads ** -0.5)
+    w_dtype = indexer.weights_proj.weight.dtype
+    # Cast only when needed: on macOS unsloth wraps Tensor.to, which fullgraph compile cannot trace.
+    x = hidden_states if hidden_states.dtype == w_dtype else hidden_states.to(w_dtype)
+    weights = indexer.weights_proj(x).float() * (indexer.n_heads ** -0.5)
     topk = min(indexer.index_topk, k.shape[1])
     attention_mask = _broadcast_mask(attention_mask, batch_size, seq_len, k.shape[1])
     out = []
@@ -410,7 +428,7 @@ def dsa_flex_eligible(module, query, key, value, attention_mask, kwargs, min_key
     budget = int(module.config.index_topk)
     if key.shape[2] <= budget or query.shape[2] < 16 or _wants_attentions(module, kwargs):
         return False
-    if torch.compiler.is_compiling():
+    if _compiled_without_break():
         return False
     if min_keys is not None and key.shape[2] < min_keys:
         return False
