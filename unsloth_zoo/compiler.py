@@ -5117,6 +5117,35 @@ def _patch_lora_base_layer_input_cast(source):
     )
 
 
+def _patch_lora_update(source):
+    # All Unsloth Zoo code licensed under LGPLv3
+    old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
+    old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
+    add = "result = result + output"
+
+    if (old1 not in source and add not in source) and (old2 not in source):
+        return source
+    # Same statement as PEFT's, so PEFT's own dtype restore (after or inside the adapter loop) still runs.
+    source = source.replace(old2, "result = lora_forward(result, lora_A, lora_B, dropout, x, scaling)")
+    if old1 not in source:
+        return source
+    # bnb Linear4bit/8bitLt never set torch_result_dtype; their result stays in the base-layer dtype.
+    if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
+        dtype_cast = "torch_result_dtype"
+    else:
+        dtype_cast = "result.dtype"
+    update = f"lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
+    # `continue` skips `result = result + output`; a `return` here would drop every later active adapter.
+    looped = source.replace(old1, f"result = {update}; continue")
+    try:
+        compile(looped, "<peft lora forward>", "exec")
+    except SyntaxError:
+        # Update outside the adapter loop.
+        return source.replace(old1, f"return {update}")
+    return looped
+pass
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -5140,25 +5169,7 @@ def patch_lora_forwards(torch_compile_options):
         source = source.replace("result = result.clone()", "")
 
         # Use addmm
-        old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
-        old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
-        add = "result = result + output"
-
-        if (old1 not in source and add not in source) and (old2 not in source):
-            pass
-        else:
-            # Linear/GPTQ/LoraParallel reassign result to float32 before the
-            # loop, so they save the original dtype in torch_result_dtype.
-            # Linear4bit/Linear8bitLt only cast x, leaving result untouched,
-            # so result.dtype is still the base-layer dtype at return time.
-            if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
-                dtype_cast = "torch_result_dtype"
-            else:
-                dtype_cast = "result.dtype"
-            replace = f"return lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
-            source = source.replace(old1, replace)
-            source = source.replace(old2, replace)
-        pass
+        source = _patch_lora_update(source)
 
         # Update function name
         source = source.replace(
@@ -5895,7 +5906,22 @@ def _install_patched_forward(model_location, module, forward, combined_module):
     pass
 
 
-def _dtype_safe_forward(original_forward, is_conv, disable):
+def _batchnorm_input_needs_cast(module, tensor):
+    """Mirrors the disable=False source rewrite cast in _patch_torch_dtype_modules."""
+    weight = getattr(module, "weight", None)
+    if weight is None or tensor.dtype == weight.dtype:
+        return False
+    bias = getattr(module, "bias", None)
+    native = (
+        weight.dtype == torch.float32
+        and tensor.dtype in (torch.float16, torch.bfloat16)
+        and not weight.requires_grad
+        and (bias is None or not bias.requires_grad)
+    )
+    return not native
+
+
+def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False):
     """The dtype casts of the source rewrite, without needing the source.
 
     Same three shapes: a conv casts its input to the weight dtype and the
@@ -5906,6 +5932,9 @@ def _dtype_safe_forward(original_forward, is_conv, disable):
     The tensor is taken by whatever name the original declares, because these
     are public forwards: `RMSNorm.forward(self, x)` and `rms_norm(x = t)` both
     work today and a hard-coded `input` would start raising TypeError.
+
+    BatchNorm casts in both modes: F.batch_norm has no autocast rule, so a
+    float32 input into a bfloat16 weight raises even compiled.
     """
     try:
         first = list(inspect.signature(original_forward).parameters)[1]
@@ -5924,6 +5953,8 @@ def _dtype_safe_forward(original_forward, is_conv, disable):
         if is_conv:
             tensor = tensor.to(self.weight.dtype)
         elif disable and getattr(self, "weight", None) is not None:
+            tensor = tensor.to(self.weight.dtype)
+        elif is_batchnorm and _batchnorm_input_needs_cast(self, tensor):
             tensor = tensor.to(self.weight.dtype)
         return original_forward(self, tensor, *rest, **kwargs).to(original_dtype)
 
@@ -5990,6 +6021,7 @@ def _patch_torch_dtype_modules(
                         function.forward.__unsloth_dtype_original__,
                         module in _conv_modules,
                         disable,
+                        is_batchnorm = module.startswith("BatchNorm"),
                     ),
                     combined_module,
                 )
@@ -6024,7 +6056,10 @@ def _patch_torch_dtype_modules(
                     model_location,
                     module,
                     _dtype_safe_forward(
-                        original_forward, module in _conv_modules, disable
+                        original_forward,
+                        module in _conv_modules,
+                        disable,
+                        is_batchnorm = module.startswith("BatchNorm"),
                     ),
                     combined_module,
                 )
@@ -6062,9 +6097,20 @@ def _patch_torch_dtype_modules(
                     body_lines = lines[1:]
                     first_body = next((l for l in body_lines if l.strip()), "")
                     body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    cast_if = "self.weight is not None"
+                    if not disable:
+                        # fp16/bf16 into frozen fp32 params is native mixed precision (no fp32 input copy).
+                        # Trainable params keep the cast: CUDA returns their grads at input-dtype precision.
+                        cast_if += (
+                            f" and {param_name}.dtype != self.weight.dtype and not ("
+                            f"self.weight.dtype == torch.float32 and "
+                            f"{param_name}.dtype in (torch.float16, torch.bfloat16) and "
+                            f"not self.weight.requires_grad and "
+                            f"(self.bias is None or not self.bias.requires_grad))"
+                        )
                     prologue = [
                         body_indent + f"original_dtype = {param_name}.dtype",
-                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                        body_indent + f"if {cast_if}: {param_name} = {param_name}.to(self.weight.dtype)",
                     ]
                     source = "\n".join([def_line] + prologue + body_lines)
                     append_str = ".to(original_dtype)\n"
