@@ -58,6 +58,7 @@ import weakref
 import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
+from ._gc_passes import collect_garbage
 from .empty_model import *
 from .empty_model import (
     FP8_MOE_SHARED_BLOCK,
@@ -1172,9 +1173,7 @@ def patch_vllm_graph_capture():
                 "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
                 end_time - start_time
             )
-            for _ in range(2):
-                gc.collect()
-                _device_empty_cache()
+            collect_garbage(passes = 2, after = _device_empty_cache)
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -1201,9 +1200,7 @@ def patch_vllm_graph_capture():
                     "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
                     end_time - start_time
                 )
-                for _ in range(2):
-                    gc.collect()
-                    _device_empty_cache()
+                collect_garbage(passes = 2, after = _device_empty_cache)
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
@@ -2487,9 +2484,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     new_model.eval()
 
     # Cleanup
-    for _ in range(3):
-        gc.collect()
-        _device_empty_cache()
+    collect_garbage(after = _device_empty_cache)
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
@@ -4516,9 +4511,7 @@ def _release_failed_vllm_engine(snapshot):
                 if _is_vllm_registry_entry(registry[key]): registry.pop(key, None)
             except Exception:
                 pass
-    for _ in range(3):
-        gc.collect()
-        _device_empty_cache()
+    collect_garbage(after = _device_empty_cache)
 pass
 
 
@@ -5617,9 +5610,7 @@ def load_vllm(
     #     llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
 
     # Cleanup
-    for _ in range(3):
-        gc.collect()
-        _device_empty_cache()
+    collect_garbage(after = _device_empty_cache)
     return llm
 pass
 
@@ -5639,10 +5630,9 @@ pass
 @torch.inference_mode
 def save_lora(model, save_directory, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
-    state_dict = model.state_dict()
     dtype = model.get_input_embeddings().weight.dtype
     # Cast LoRA to float16 / bfloat16
-    state_dict = {k:v.to(dtype) for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    state_dict = {k:v.to(dtype) for k, v in _lora_state_dict(model).items()}
     kwargs["state_dict"] = state_dict
     rank, world_size = _distributed_rank_and_world()
     if world_size <= 1 or kwargs.get("push_to_hub", False):
@@ -6778,9 +6768,60 @@ def _merged_rollout_targets(model):
 pass
 
 
+def _lora_is_sharded(model):
+    """True when FSDP2 holds the adapters as DTensors. Only True is cached: sharding happens after load."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if model.__dict__.get("_unsloth_lora_is_sharded"): return True
+    # DTensors need a process group, so a single process never walks the parameters.
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return False
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        return False
+    # First adapter decides; avoids walking every parameter on each load_lora.
+    sharded = False
+    for n, p in model.named_parameters():
+        if ".lora_A." in n or ".lora_B." in n:
+            sharded = isinstance(p, DTensor)
+            break
+    if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
+    return sharded
+pass
+
+
+def _lora_state_dict(model):
+    """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
+    inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor"."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    def lora_items(state_dict):
+        return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    if not _lora_is_sharded(model):
+        return lora_items(model.state_dict())
+    from torch.distributed.tensor import DTensor
+    _merged_rollout_log_once(
+        "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
+        "so every rank must call them (a call on rank 0 alone waits for the others)."
+    )
+    with torch.inference_mode(False), torch.no_grad():
+        return {
+            k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()
+            for k, v in lora_items(model.state_dict()).items()
+        }
+pass
+
+
 def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
+    if _lora_is_sharded(model):
+        # Fold needs whole deltas; vLLM LoRA serves the gathered adapters instead.
+        if getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
+            _merged_rollout_log_once(
+                "Unsloth: merged-weight vLLM rollouts are off under native FSDP2 (sharded adapters); "
+                "vLLM LoRA serves the gathered adapters instead."
+            )
+        return None
     with _MERGED_ROLLOUT_LOCK:
         return _prepare_merged_rollout_locked(model)
 pass
@@ -7370,9 +7411,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = model.state_dict()
-        items = state_dict.items()
-        state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
+        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model).items()}
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
@@ -8042,9 +8081,7 @@ def _test_get_vllm_state_dict(
     del model
     del new_model
     print(f'Test passed!')
-    for _ in range(3):
-        gc.collect()
-        _device_empty_cache()
+    collect_garbage(after = _device_empty_cache)
 pass
 
 
